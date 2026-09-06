@@ -1857,6 +1857,9 @@ def create_canonical_flow_dataset(
     valid_threshold: float = PHASE_A_VALID_THRESHOLD,
     relaxed_threshold: float = PHASE_A_RELAXED_THRESHOLD,
     output_path: str | os.PathLike | None = None,
+    zig_model=None,
+    scaler_X=None,
+    device=None,
 ):
     """Canonical Phase-A dataset: flow-labelled, min-power tie-break, frozen.
 
@@ -1871,6 +1874,14 @@ def create_canonical_flow_dataset(
     only (the rest of the RegimeAwareLoss machinery is held out so that
     Phase A isolates model capacity + optimization from surrogate-gradient
     credit assignment).
+
+    Plan phase-a-fixes, bug 2: ``zig_model``/``scaler_X``/``device`` are
+    optional explicit kwargs, each falling back independently to
+    ``_active_zig()`` / ``_active_scalers()[0]`` / ``_active_device()`` when
+    None (same per-arg pattern as :func:`create_mlp_distillation_dataset`).
+    Harnesses that wire their own locals (nuance, MoE) pass all three and
+    never touch the module-level ``_active_ctx``; existing ``setup()``-based
+    callers (plain-mlp) keep working unchanged.
     """
     if teacher_labeler is None:
         teacher_labeler = FlowTeacherLabeler(
@@ -1900,9 +1911,9 @@ def create_canonical_flow_dataset(
         )
         labels_topk[i] = np.asarray(top, dtype=np.float64).reshape(top_k, 7)
 
-    zig_model = _active_zig()
-    scaler_X = _active_scalers()[0]
-    device = _active_device()
+    zig_model = zig_model if zig_model is not None else _active_zig()
+    scaler_X = scaler_X if scaler_X is not None else _active_scalers()[0]
+    device = device if device is not None else _active_device()
     n_invalid = 0
     n_relaxed = 0
     chosen = np.zeros((len(specs_arr), 7), dtype=np.float64)

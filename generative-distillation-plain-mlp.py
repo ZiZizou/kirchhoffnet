@@ -243,6 +243,7 @@ def main():
                     boundary_ratio=float(args.phase_a_boundary_ratio),
                     seed=int(args.seed),
                     output_path=target_path,
+                    zig_model=ctx["zig_model"], scaler_X=ctx["scaler_X"], device=ctx["DEVICE"],
                 )
             if not args.canonical_dataset:
                 _logger.info("[phaseA] --prepare-canonical-dataset set: exiting before training")

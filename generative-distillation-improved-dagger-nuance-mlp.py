@@ -2578,6 +2578,7 @@ if _bo_args.canonical_dataset is not None or _bo_args.prepare_canonical_dataset 
                 boundary_ratio=float(_bo_args.phase_a_boundary_ratio),
                 seed=int(_bo_args.seed if _bo_args.seed is not None else 100),
                 output_path=target_path,
+                zig_model=zig_model, scaler_X=scaler_X, device=DEVICE,
             )
         if not _bo_args.canonical_dataset:
             _logger.info("[phaseA] --prepare-canonical-dataset set: exiting before training")

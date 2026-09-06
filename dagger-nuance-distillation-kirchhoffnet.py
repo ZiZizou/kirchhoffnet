@@ -655,6 +655,10 @@ LOG_BOUNDS = [-15.0, 8]
 # Allows `python dagger-nuance-distillation-kirchhoffnet.py --dagger-iterations 4
 # --epochs-per-iter 100 ...` to override hyperparams without editing the file.
 # Unknown args are ignored so normal `python script.py` still uses defaults.
+# Default BEFORE the BO-override try block so a parse failure inside try
+# can never leave this undefined for the checkpoint gate (~line 3059).
+# Audit fix (phase-a-fixes follow-up): previously defined only inside try.
+_phase_a_requested = False
 try:
     import argparse as _argparse
     _bo_parser = _argparse.ArgumentParser(add_help=False)
@@ -716,6 +720,15 @@ try:
                             help='Multiplier on the LR for the remaining dynamic (cell library) '
                                  'parameters (Friedman recipe; default 1.0).')
     _bo_args, _ = _bo_parser.parse_known_args()
+    # Phase-A request flag (plan phase-a-fixes, bug 1): when set, the
+    # checkpoint restore below MUST be skipped so a stale shared-default
+    # checkpoint (e.g. /home/annaik/.../dagger_checkpoint.pt from a prior
+    # 52-edge / VCA-rank-3 architecture) never silently warm-starts a
+    # Phase-A BO trial of the current 56-edge / VCA-rank-2 architecture.
+    _phase_a_requested = (
+        _bo_args.prepare_canonical_dataset is not None
+        or _bo_args.canonical_dataset is not None
+    )
     if _bo_args.dagger_iterations is not None:
         DAGGER_ITERATIONS = _bo_args.dagger_iterations
     if _bo_args.epochs_per_iter is not None:
@@ -3040,7 +3053,15 @@ scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
 # model/optimizer/scheduler state, RNG, dataset, and histories — is wrapped
 # in one try/except so any legacy/incompatible field gracefully degrades to
 # a fresh start instead of crashing.
-ckpt = load_checkpoint()
+#
+# Plan phase-a-fixes, bug 1: Phase-A runs (--prepare-canonical-dataset or
+# --canonical-dataset) skip the restore entirely.  The shared default
+# CHECKPOINT_PATH may carry a stale model from a different architecture
+# (different edge count / VCA rank); even strict=False masking is unsafe
+# because the VCA core weights would silently warm-start the BO trial.
+ckpt = None
+if not _phase_a_requested:
+    ckpt = load_checkpoint()
 distillation_dataset = None
 if ckpt is not None:
     try:
@@ -3097,6 +3118,7 @@ if _bo_args.prepare_canonical_dataset is not None or _bo_args.canonical_dataset 
                 boundary_ratio=float(_bo_args.phase_a_boundary_ratio),
                 seed=int(_bo_args.seed if _bo_args.seed is not None else 100),
                 output_path=target_path,
+                zig_model=zig_model, scaler_X=scaler_X, device=DEVICE,
             )
         if not _bo_args.canonical_dataset:
             _logger.info("[phaseA] --prepare-canonical-dataset set: exiting before training")

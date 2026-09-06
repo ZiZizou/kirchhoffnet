@@ -903,6 +903,14 @@ def main() -> None:
         n_workers = max(1, args.n_workers)
 
     db_path = run_dir / (study_name + ".db")
+    # Audit fix (phase-a-fixes follow-up): capture resume state HERE, next to
+    # db_path, so the pre-study prints below can report it.  Previously
+    # study_was_resumed was assigned only at the deferred create/load block
+    # but read by an earlier print -> UnboundLocalError on every run (same
+    # bug class as retry_params/study).  Nothing between here and create/load
+    # touches storage (sampler/pruner construction, prints, budget/feasible/
+    # fingerprint computation), so this pre-create value is authoritative.
+    study_was_resumed = db_path.exists()
     # KNet's topology, solver, and optimizer parameters interact strongly.
     sampler = TPESampler(seed=args.seed, multivariate=True, group=True)
     pruner = (
@@ -919,37 +927,12 @@ def main() -> None:
     # against the loaded study BEFORE any ``suggest_*`` call. The fingerprint
     # is computed in the same block that builds the feasible list.
 
-    # Enqueue recovered parameter sets after the old RUNNING rows have been
-    # finalized. Optuna will assign each retry a new trial number.
-    for retry_index, params in enumerate(retry_params):
-        study.enqueue_trial(
-            params,
-            user_attrs={
-                "recovered_trial": True,
-                "recovered_seed_trial": retry_index in recovered_seed_indices,
-            },
-        )
-
-    if (args.dataset in START_POINTS
-            and not args.no_seed_trial):
-        seed_already_complete = any(
-            t.user_attrs.get("seed_trial") is True
-            and t.state == optuna.trial.TrialState.COMPLETE
-            for t in study.trials
-        )
-        seed_already_queued = any(
-            t.state == optuna.trial.TrialState.WAITING
-            and (
-                t.user_attrs.get("seed_trial") is True
-                or t.user_attrs.get("recovered_seed_trial") is True
-            )
-            for t in study.trials
-        )
-        if not seed_already_complete and not seed_already_queued:
-            study.enqueue_trial(
-                START_POINTS[args.dataset],
-                user_attrs={"seed_trial": True},
-            )
+    # Plan phase-a-fixes, bug 3: the retry-enqueue + seed-trial enqueue blocks
+    # were previously run BEFORE study create/load, hitting UnboundLocalError
+    # on retry_params / study on any fresh run.  Moved just after the
+    # create/load block to preserve the fingerprint-guard-before-recovery
+    # ordering ("check sampling fingerprint, then mark RUNNING->FAIL, then
+    # re-enqueue WAITING trials with new trial numbers").  Pure reorder.
 
     repo_dir = Path(__file__).resolve().parent
     script_path = repo_dir / "train_script.py"
@@ -1042,7 +1025,7 @@ def main() -> None:
         "ctle_objective": args.ctle_objective,
     })
 
-    study_was_resumed = db_path.exists()
+    # study_was_resumed was captured next to db_path above (pre-create state).
     if study_was_resumed:
         study = optuna.load_study(study_name=study_name, storage=storage,
                                   sampler=sampler, pruner=pruner)
@@ -1066,6 +1049,39 @@ def main() -> None:
         study.set_user_attr("sampling_fingerprint", sampling_fingerprint)
         retry_params = []
         recovered_seed_indices = set()
+
+    # Enqueue recovered parameter sets after the old RUNNING rows have been
+    # finalized. Optuna will assign each retry a new trial number.
+    for retry_index, params in enumerate(retry_params):
+        study.enqueue_trial(
+            params,
+            user_attrs={
+                "recovered_trial": True,
+                "recovered_seed_trial": retry_index in recovered_seed_indices,
+            },
+        )
+
+    if (args.dataset in START_POINTS
+            and not args.no_seed_trial):
+        seed_already_complete = any(
+            t.user_attrs.get("seed_trial") is True
+            and t.state == optuna.trial.TrialState.COMPLETE
+            for t in study.trials
+        )
+        seed_already_queued = any(
+            t.state == optuna.trial.TrialState.WAITING
+            and (
+                t.user_attrs.get("seed_trial") is True
+                or t.user_attrs.get("recovered_seed_trial") is True
+            )
+            for t in study.trials
+        )
+        if not seed_already_complete and not seed_already_queued:
+            study.enqueue_trial(
+                START_POINTS[args.dataset],
+                user_attrs={"seed_trial": True},
+            )
+
     ctle_cache_dir: Path | None = None
     if args.dataset == "ctle":
         ctle_cache_dir = (args.ctle_initial_dataset_cache_dir
