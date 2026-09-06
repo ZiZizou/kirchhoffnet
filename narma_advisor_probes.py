@@ -70,9 +70,10 @@ ESN_HALT_ABOVE: float = 0.6
 # Frozen-state decision thresholds (advisor-probe-suite spec).
 RIDGE_PROMOTE_READOUT_BELOW: float = 0.45
 RIDGE_INIT_REGIME_AT_OR_ABOVE: float = 0.6
-# E0 corner decision threshold (spec).
+# E0 corner decision thresholds (P2 rerun amendment).
 E0_PASS_MC_ABOVE: float = 3.0
-E0_PASS_RIDGE_BELOW: float = 0.5
+E0_PASS_RIDGE_BELOW: float = 0.40
+E0_PASS_STATE_PR_MIN: float = 6.0
 # Rail fraction disqualifier (spec).
 RAIL_DISQUALIFY_ABOVE: float = 0.05
 # Train-stream washout for frozen-state / E0 probes (matches the
@@ -101,25 +102,42 @@ class FrozenStateRow:
 
 @dataclass
 class E0SweepRow:
-    """One E0 sweep corner."""
+    """One E0 sweep corner, including its boundary-only pass."""
 
     config_tag: str
+    hidden_dim: int
+    n_params: int
     gm_init: float
     leak_mode: str  # "slow-fixed" | "randomized" | "constant:<val>"
     drive: float
     ridge_nrmse: float
     ridge_r2: float
     mc_total_washout_corrected: float
+    state_pr: float  # participation ratio of washed full states
     jac_max_abs: float
     jac_min_abs: float
     jac_mean_abs: float
     jac_rank_proxy: float  # participation ratio of |eig|
     rail_frac: float
     sat_max_ratio: float  # max|x| / x_max
+    gate_zero_ridge_nrmse: float
+    gate_zero_ridge_r2: float
+    gate_zero_mc_total: float
+    gate_zero_state_pr: float
+    gate_zero_jac_max_abs: float
+    gate_zero_jac_min_abs: float
+    gate_zero_jac_mean_abs: float
+    gate_zero_jac_rank_proxy: float
+    gate_zero_rail_frac: float
+    gate_zero_sat_max_ratio: float
     rail_disqualified: bool
-    pass_init_regime: bool  # MC>E0_PASS_MC_ABOVE and ridge<E0_PASS_RIDGE_BELOW
+    pass_init_regime: bool
     pass_rail: bool  # NOT rail_disqualified
     pass_all: bool  # pass_init_regime AND pass_rail
+    gate_zero_rail_disqualified: bool
+    gate_zero_pass_init_regime: bool
+    gate_zero_pass_rail: bool
+    gate_zero_pass_all: bool
 
 
 def participation_ratio(states: torch.Tensor) -> float:
@@ -650,6 +668,62 @@ def jacobian_eigs(
     return rows
 
 
+def _score_state_trajectory(
+    *, stage: nn.Module, states_full: torch.Tensor,
+    u_seq: torch.Tensor, y_seq: torch.Tensor,
+    washout: int, jacobian_samples: int,
+    t_span: float, num_steps: int,
+) -> dict[str, float]:
+    """Score one collected trajectory with the complete E0 instrument set."""
+    if states_full.dim() != 2 or u_seq.dim() != 1 or y_seq.dim() != 1:
+        raise ValueError(
+            "trajectory scoring requires (T, N) states and (T,) input/targets, got "
+            f"{tuple(states_full.shape)}, {tuple(u_seq.shape)}, {tuple(y_seq.shape)}"
+        )
+    if not (
+        states_full.shape[0] == u_seq.shape[0] == y_seq.shape[0]
+        and states_full.shape[0] > washout
+    ):
+        raise ValueError(
+            "states, inputs, and targets must have the same length above washout, got "
+            f"{states_full.shape[0]}, {u_seq.shape[0]}, {y_seq.shape[0]} "
+            f"with washout={washout}"
+        )
+    x_max = float(stage.x_max)
+    with torch.no_grad():
+        sat_max = float(states_full.abs().max().item())
+        rail_frac = float((states_full.abs() > 0.9 * x_max).float().mean().item())
+    state_pr = participation_ratio(states_full[washout:])
+    dt = t_span / num_steps
+    transitions = _select_transition_points(
+        states_full, u_seq, washout=washout, n_samples=jacobian_samples,
+    )
+    j_rows = jacobian_eigs(stage, transitions, dt=dt, num_steps=num_steps)
+    X = states_full[washout:]
+    y = y_seq[washout:]
+    W = _ridge_fit_predict(X, y, l2=1e-2)
+    pred = torch.cat(
+        [X, torch.ones(X.shape[0], 1, device=X.device)], dim=1,
+    ) @ W
+    _, mc = memory_capacity_washout(
+        states_full, u_seq, washout=washout, max_delay=20,
+    )
+    return {
+        "ridge_nrmse": ne.nrmse(pred, y),
+        "ridge_r2": ne.r2(pred, y),
+        "mc_total": float(mc),
+        "state_pr": float(state_pr),
+        "jac_max_abs": float(max(r["max_abs"] for r in j_rows)),
+        "jac_min_abs": float(min(r["min_abs"] for r in j_rows)),
+        "jac_mean_abs": float(
+            sum(r["mean_abs"] for r in j_rows) / len(j_rows)
+        ),
+        "jac_rank_proxy": float(max(r["rank_proxy"] for r in j_rows)),
+        "rail_frac": float(rail_frac),
+        "sat_max_ratio": float(sat_max / x_max) if x_max > 0 else float("nan"),
+    }
+
+
 def _select_corner_subset(
     drive_grid: Iterable[float], leak_grid: Iterable[Any],
     gain_grid: Iterable[float], max_corners: int | None,
@@ -680,7 +754,7 @@ def _e0_row(
     raw_leak_init_seed: int = 0, washout: int = PROBE_WASHOUT,
     jacobian_samples: int = 3,
 ) -> E0SweepRow:
-    """Score one E0 sweep corner from one state-collection pass."""
+    """Score one E0 sweep corner from normal and boundary-only passes."""
     if len(list(net.core.stages)) != 1:
         raise NotImplementedError(
             "E0 corners currently support single-stage nets only"
@@ -716,66 +790,85 @@ def _e0_row(
             x0=x0, t_span=t_span, num_steps=num_steps, u_seq=u_train,
         )
     states_full = all_states[:, 0, :].detach()
-
-    x_max = float(stage.x_max)
-    with torch.no_grad():
-        sat_max = float(states_full.abs().max().item())
-        rail_frac = float((states_full.abs() > 0.9 * x_max).float().mean().item())
-
-    # Jacobian at observed mid-stream transitions: each selected state and
-    # the input that generated the following state.
-    dt = t_span / num_steps
-    transitions = _select_transition_points(
-        states_full, u_train, washout=washout, n_samples=jacobian_samples,
-    )
-    j_rows = jacobian_eigs(stage, transitions, dt=dt, num_steps=num_steps)
-    max_abs = max(r["max_abs"] for r in j_rows)
-    min_abs = min(r["min_abs"] for r in j_rows)
-    mean_abs = sum(r["mean_abs"] for r in j_rows) / len(j_rows)
-    rank_proxy = max(r["rank_proxy"] for r in j_rows)
-
-    X = states_full[washout:]
-    y = y_train[washout:]
-    W = _ridge_fit_predict(X, y, l2=1e-2)
-    pred = torch.cat(
-        [X, torch.ones(X.shape[0], 1, device=X.device)], dim=1,
-    ) @ W
-    ridge_nrmse = ne.nrmse(pred, y)
-    ridge_r2 = ne.r2(pred, y)
-    # MC reconstructs u(n-k).  Scaling is linear, so the scaled drive gives
-    # the same R² values as the raw NARMA input while matching what the
-    # fabric actually sees.
-    _, mc = memory_capacity_washout(
-        states_full, u_train, washout=washout, max_delay=20,
+    normal = _score_state_trajectory(
+        stage=stage, states_full=states_full,
+        u_seq=u_train, y_seq=y_train,
+        washout=washout, jacobian_samples=jacobian_samples,
+        t_span=t_span, num_steps=num_steps,
     )
 
-    rail_disqualified = rail_frac > RAIL_DISQUALIFY_ABOVE
-    pass_init_regime = mc > E0_PASS_MC_ABOVE and ridge_nrmse < E0_PASS_RIDGE_BELOW
+    # Boundary-only pass: suppress core-edge gates transiently, then score
+    # the same instruments on the resulting trajectory.
+    gate_states_full = _gate_zero_eval_forward(net, u_train)[:, 0, :].detach()
+    boundary_only = _score_state_trajectory(
+        stage=stage, states_full=gate_states_full,
+        u_seq=u_train, y_seq=y_train,
+        washout=washout, jacobian_samples=jacobian_samples,
+        t_span=t_span, num_steps=num_steps,
+    )
+
+    rail_disqualified = normal["rail_frac"] > RAIL_DISQUALIFY_ABOVE
+    pass_init_regime = (
+        normal["mc_total"] > E0_PASS_MC_ABOVE
+        and normal["ridge_nrmse"] <= E0_PASS_RIDGE_BELOW
+        and normal["state_pr"] >= E0_PASS_STATE_PR_MIN
+    )
+    gate_zero_rail_disqualified = (
+        boundary_only["rail_frac"] > RAIL_DISQUALIFY_ABOVE
+    )
+    gate_zero_pass_init_regime = (
+        boundary_only["mc_total"] > E0_PASS_MC_ABOVE
+        and boundary_only["ridge_nrmse"] <= E0_PASS_RIDGE_BELOW
+        and boundary_only["state_pr"] >= E0_PASS_STATE_PR_MIN
+    )
+    hidden_dim = int(net.hid_count)
+    n_params = sum(
+        p.numel() for p in net.parameters() if p.requires_grad
+    )
     config_tag = (
         f"order{order}_seed{seed}_{device}_tanhfree"
-        f"_k{int(stage.core_refresh_interval)}"
+        f"_h{hidden_dim}_k{int(stage.core_refresh_interval)}"
         f"_tspan{t_span:g}_steps{num_steps}"
         f"_gm{float(gm_init):g}_leak{leak_mode}_drive{float(drive):g}"
         f"_washout{washout}_jac{jacobian_samples}"
     )
     return E0SweepRow(
         config_tag=config_tag,
+        hidden_dim=hidden_dim,
+        n_params=n_params,
         gm_init=float(gm_init),
         leak_mode=str(leak_mode),
         drive=float(drive),
-        ridge_nrmse=ridge_nrmse,
-        ridge_r2=ridge_r2,
-        mc_total_washout_corrected=float(mc),
-        jac_max_abs=float(max_abs),
-        jac_min_abs=float(min_abs),
-        jac_mean_abs=float(mean_abs),
-        jac_rank_proxy=float(rank_proxy),
-        rail_frac=float(rail_frac),
-        sat_max_ratio=float(sat_max / x_max) if x_max > 0 else float("nan"),
+        ridge_nrmse=normal["ridge_nrmse"],
+        ridge_r2=normal["ridge_r2"],
+        mc_total_washout_corrected=normal["mc_total"],
+        state_pr=normal["state_pr"],
+        jac_max_abs=normal["jac_max_abs"],
+        jac_min_abs=normal["jac_min_abs"],
+        jac_mean_abs=normal["jac_mean_abs"],
+        jac_rank_proxy=normal["jac_rank_proxy"],
+        rail_frac=normal["rail_frac"],
+        sat_max_ratio=normal["sat_max_ratio"],
+        gate_zero_ridge_nrmse=boundary_only["ridge_nrmse"],
+        gate_zero_ridge_r2=boundary_only["ridge_r2"],
+        gate_zero_mc_total=boundary_only["mc_total"],
+        gate_zero_state_pr=boundary_only["state_pr"],
+        gate_zero_jac_max_abs=boundary_only["jac_max_abs"],
+        gate_zero_jac_min_abs=boundary_only["jac_min_abs"],
+        gate_zero_jac_mean_abs=boundary_only["jac_mean_abs"],
+        gate_zero_jac_rank_proxy=boundary_only["jac_rank_proxy"],
+        gate_zero_rail_frac=boundary_only["rail_frac"],
+        gate_zero_sat_max_ratio=boundary_only["sat_max_ratio"],
         rail_disqualified=rail_disqualified,
         pass_init_regime=pass_init_regime,
         pass_rail=not rail_disqualified,
         pass_all=pass_init_regime and not rail_disqualified,
+        gate_zero_rail_disqualified=gate_zero_rail_disqualified,
+        gate_zero_pass_init_regime=gate_zero_pass_init_regime,
+        gate_zero_pass_rail=not gate_zero_rail_disqualified,
+        gate_zero_pass_all=(
+            gate_zero_pass_init_regime and not gate_zero_rail_disqualified
+        ),
     )
 
 
@@ -786,7 +879,7 @@ def e0_sweep(
     drive_grid: Iterable[float] = E0_DRIVE_GRID,
     n_streams: int = 4, train_samples_per_stream: int = 2500,
     washout: int = PROBE_WASHOUT, jacobian_samples: int = 3,
-    t_span: float = 1.0, num_steps: int = 8,
+    t_span: float = 1.0, num_steps: int = 8, hidden_dim: int = 25,
     net_factory: Any | None = None,
     selected_corners: Iterable[tuple[float, Any, float]] | None = None,
 ) -> list[E0SweepRow]:
@@ -823,6 +916,8 @@ def e0_sweep(
         raise ValueError(f"t_span must be positive, got {t_span}")
     if num_steps < 1:
         raise ValueError(f"num_steps must be positive, got {num_steps}")
+    if hidden_dim < 1:
+        raise ValueError(f"hidden_dim must be positive, got {hidden_dim}")
     if selected_corners is None:
         corners = _select_corner_subset(drive_grid, leak_grid, gain_grid, None)
     else:
@@ -860,6 +955,7 @@ def e0_sweep(
                 order=order, seed=seed, freeze_read=False,
                 t_span=t_span, num_steps=num_steps,
                 cell_library="tanh_free",
+                hidden_dim=hidden_dim,
                 core_refresh_interval=0,
                 leak_constant=None,
                 compile_sequence=False,
@@ -1005,6 +1101,7 @@ def main(argv: list[str] | None = None) -> int:
     p_e0.add_argument("--jacobian-samples", type=int, default=3)
     p_e0.add_argument("--t-span", type=float, default=1.0)
     p_e0.add_argument("--num-steps", type=int, default=8)
+    p_e0.add_argument("--hidden-dim", type=int, default=25)
     p_e0.add_argument("--gain-grid", type=str, default="-5,-2,0,1.5",
                       help="Comma-separated gm_init values (default -5,-2,0,1.5)")
     p_e0.add_argument(
@@ -1148,6 +1245,7 @@ def main(argv: list[str] | None = None) -> int:
             train_samples_per_stream=args.train_samples,
             jacobian_samples=args.jacobian_samples,
             t_span=args.t_span, num_steps=args.num_steps,
+            hidden_dim=args.hidden_dim,
             selected_corners=selected_corners,
         )
         elapsed = time.time() - t0
@@ -1159,17 +1257,18 @@ def main(argv: list[str] | None = None) -> int:
                f"{len(rows)} corners in {elapsed:.1f}s")
         lines = [
             f"{'gm':>6} {'leak':>14} {'drive':>5} {'ridge':>7} "
-            f"{'mc':>6} {'jac_max':>7} {'jac_mean':>8} {'jac_min':>7} "
-            f"{'jac_pr':>6} {'rail%':>6} {'sat':>5}  pass",
+            f"{'mc':>6} {'sPR':>6} {'gzR':>7} {'gzMC':>6} "
+            f"{'gzPR':>6} {'rail%':>6} {'pass':>4} {'gzpass':>6}",
         ]
         for r in rows:
             lines.append(
                 f"{r.gm_init:>6.2f} {r.leak_mode:>14} {r.drive:>5.2f} "
                 f"{r.ridge_nrmse:>7.4f} {r.mc_total_washout_corrected:>6.2f} "
-                f"{r.jac_max_abs:>7.3f} {r.jac_mean_abs:>8.3f} {r.jac_min_abs:>7.3f} "
-                f"{r.jac_rank_proxy:>6.2f} {100.0 * r.rail_frac:>5.1f}% "
-                f"{r.sat_max_ratio:>5.2f}  "
-                f"{'PASS' if r.pass_all else 'FAIL'}"
+                f"{r.state_pr:>6.2f} {r.gate_zero_ridge_nrmse:>7.4f} "
+                f"{r.gate_zero_mc_total:>6.2f} {r.gate_zero_state_pr:>6.2f} "
+                f"{100.0 * r.rail_frac:>5.1f}% "
+                f"{'PASS' if r.pass_all else 'FAIL':>4} "
+                f"{'PASS' if r.gate_zero_pass_all else 'FAIL':>6}"
             )
         write_probe_txt(args.output / "e0_sweep.txt", hdr, lines)
         print("\n".join([hdr] + lines))
@@ -1181,7 +1280,8 @@ def main(argv: list[str] | None = None) -> int:
             best = min(passing, key=lambda r: r.ridge_nrmse)
             print(
                 f"  DECISION: INIT-SEARCH-WARRANTED. {len(passing)} corner(s) "
-                f"with MC>{E0_PASS_MC_ABOVE} and ridge<{E0_PASS_RIDGE_BELOW}; "
+                f"with MC>{E0_PASS_MC_ABOVE}, ridge<={E0_PASS_RIDGE_BELOW}, "
+                f"state-PR>={E0_PASS_STATE_PR_MIN}, and rail pass; "
                 f"best ridge={best.ridge_nrmse:.4f} at "
                 f"gm={best.gm_init}, leak={best.leak_mode}, drive={best.drive}. "
                 f"Next: init search + 1 confirmation train."
@@ -1189,8 +1289,9 @@ def main(argv: list[str] | None = None) -> int:
         elif rail_pass and not passing:
             print(
                 f"  DECISION: NO-CORNER-BREAKS-RIDGE. {len(rail_pass)} corner(s) "
-                f"pass rail but none reach MC>{E0_PASS_MC_ABOVE} & "
-                f"ridge<{E0_PASS_RIDGE_BELOW}. Next: structural talk "
+                f"pass rail but none reach MC>{E0_PASS_MC_ABOVE}, "
+                f"ridge<={E0_PASS_RIDGE_BELOW}, and "
+                f"state-PR>={E0_PASS_STATE_PR_MIN}. Next: structural talk "
                 f"(systolic delay-line candidate; depth-per-sample stays paused)."
             )
         else:
@@ -1210,6 +1311,7 @@ def main(argv: list[str] | None = None) -> int:
                 "core_refresh_interval": 0,
                 "t_span": args.t_span,
                 "num_steps": args.num_steps,
+                "hidden_dim": args.hidden_dim,
             },
             "n_streams": args.n_streams,
             "train_samples": args.train_samples,
@@ -1227,7 +1329,8 @@ def main(argv: list[str] | None = None) -> int:
             "elapsed_s": elapsed,
             "thresholds": {
                 "mc_above": E0_PASS_MC_ABOVE,
-                "ridge_below": E0_PASS_RIDGE_BELOW,
+                "ridge_below_or_equal": E0_PASS_RIDGE_BELOW,
+                "state_pr_min": E0_PASS_STATE_PR_MIN,
                 "rail_disqualify_above": RAIL_DISQUALIFY_ABOVE,
             },
             "rows": row_dicts,

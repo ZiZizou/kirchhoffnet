@@ -1489,22 +1489,26 @@ def _build_fabric_net(
     core_refresh_interval: int,
     leak_constant: float | None,
     compile_sequence: bool,
+    hidden_dim: int | None = None,
 ) -> tuple[nn.Module, float, int]:
     """Build the NARMA fabric net (preset + topology + optional compile).
 
     Shared by training (run_fabric_condition) and eval-only
     (run_eval_masks) paths so both construct bit-identical architectures
     from the same arguments. Returns ``(net, t_span, num_steps)`` with
-    CLI fallbacks resolved.
+    CLI fallbacks resolved. ``hidden_dim=None`` preserves the canonical
+    preset width; an explicit value selects another square torus width.
     """
     base = PRESET_NARMA20 if order == 20 else PRESET_NARMA10
     if t_span is None:
         t_span = base["stages"][0]["t_span"]
     if num_steps is None:
         num_steps = base["stages"][0]["num_steps"]
+    if hidden_dim is None:
+        hidden_dim = base["stages"][0]["num_hidden"]
     preset = make_narma_preset(
         order=order,
-        hidden_dim=base["stages"][0]["num_hidden"],
+        hidden_dim=hidden_dim,
         t_span=t_span,
         num_steps_per_sample=num_steps,
         core_refresh_interval=core_refresh_interval,
