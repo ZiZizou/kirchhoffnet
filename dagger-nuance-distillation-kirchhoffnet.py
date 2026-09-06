@@ -625,6 +625,8 @@ KN_BOUNDARY_FAN_OUT = '{"0": [2, 4], "1": [1, 3], "2": [12, 5], "3": [7, 9]}'  #
 KN_INPUT_RAIL       = 4.0     # clamp normalized input to [-KN_INPUT_RAIL, KN_INPUT_RAIL] (x_max=4.0)
 
 KN_X_MAX            = 4.0     # local knet rail (overrides PHYS["x_max"]=3.0 via build_net_from_config x_max kwarg)
+KN_GM_MAX           = None    # cell-library gm_max override (None -> config default 10.0); set via --kn-gm-max
+KN_ISAT_MAX         = None    # cell-library isat_max override (None -> config default 10.0); set via --kn-isat-max
 
 # VCA (Voltage-Controlled Amplifier) gating knobs — mirrored from train_script.py
 # argparse flags so the DAgger student matches the canonical train.py surface.
@@ -684,6 +686,35 @@ try:
     _bo_parser.add_argument('--data-dir', type=str, default=None)
     _bo_parser.add_argument('--teacher-dir', type=str, default=None)
     _bo_parser.add_argument('--seed', type=int, default=None)
+    # Canonical Phase-A flags (plan canonical-ctle-unify).  When --canonical-dataset
+    # is passed, the script bypasses DAgger and runs the static-data, Huber-only
+    # Phase-A training mode (no relabeling, no surrogate-through terms).  When
+    # --prepare-canonical-dataset is passed, only the canonical .npz is built
+    # and the script exits.
+    from pathlib import Path  # local import keeps the top-of-file imports tidy
+    _bo_parser.add_argument('--canonical-dataset', type=str, default=None,
+                            help='Path to canonical Phase-A .npz (specs + flow labels). '
+                                 'When provided, DAgger is bypassed and run_phase_a_training is used.')
+    _bo_parser.add_argument('--prepare-canonical-dataset', type=str, default=None,
+                            help='Path to write the canonical Phase-A .npz and exit (no training).')
+    _bo_parser.add_argument('--phase-a-epochs', type=int, default=None,
+                            help='Phase-A training epochs (overrides --epochs-per-iter when in Phase A).')
+    _bo_parser.add_argument('--phase-a-boundary-ratio', type=float, default=0.5,
+                            help='Boundary ratio used when preparing the canonical dataset (default 0.5).')
+    _bo_parser.add_argument('--phase-a-n-samples', type=int, default=20000,
+                            help='Number of specs in the canonical dataset (default 20000).')
+    # KNet Friedman recipe (differential LR groups + cell bounds).  All are
+    # no-ops when left at their default — single AdamW group with the base LR
+    # is used, matching the previous MLP/Plain student behavior.
+    _bo_parser.add_argument('--kn-mapper-lr-scale', type=float, default=1.0,
+                            help='Multiplier on the LR for input_mapper / output_mapper / '
+                                 'post_readout_transfer groups (Friedman recipe; default 1.0).')
+    _bo_parser.add_argument('--kn-struct-lr-scale', type=float, default=1.0,
+                            help='Multiplier on the LR for z/u logits, raw_leak, VCA groups '
+                                 '(Friedman recipe; default 1.0).')
+    _bo_parser.add_argument('--kn-dyn-lr-scale', type=float, default=1.0,
+                            help='Multiplier on the LR for the remaining dynamic (cell library) '
+                                 'parameters (Friedman recipe; default 1.0).')
     _bo_args, _ = _bo_parser.parse_known_args()
     if _bo_args.dagger_iterations is not None:
         DAGGER_ITERATIONS = _bo_args.dagger_iterations
@@ -751,12 +782,13 @@ try:
             SOLVER["t_span"] = float(_bo_args.t_span)
         except Exception:
             pass
-    # kn-gm/isat overrides: applied via PARAM_LOG_BOUNDS if provided
+    # kn-gm/isat overrides: forwarded into the student constructor so the
+    # cell library is built with the BO-suggested bounds (param-neutral:
+    # bounds change no parameter count, only the sigmoid operating range).
     if _bo_args.kn_gm_max is not None:
-        try:
-            pass  # handled via cell_library defaults; kept for CLI compat
-        except Exception:
-            pass
+        KN_GM_MAX = float(_bo_args.kn_gm_max)
+    if _bo_args.kn_isat_max is not None:
+        KN_ISAT_MAX = float(_bo_args.kn_isat_max)
 except Exception as _e:
     _logger.warning(f"[BO] override parsing failed: {_e}")
 
@@ -1579,7 +1611,9 @@ class LocalKirchhoffStudentWrapper(nn.Module):
                  vca_core_enabled: bool = False,
                  vca_gate_shunt: bool = False,
                  vca_separate_core_bus: bool = False,
-                 vca_bias: bool = False):
+                 vca_bias: bool = False,
+                 gm_max: float | None = None,
+                 isat_max: float | None = None):
         super().__init__()
 
         if param_log_bounds is None:
@@ -1626,6 +1660,11 @@ class LocalKirchhoffStudentWrapper(nn.Module):
         self.vca_gate_shunt = bool(vca_gate_shunt)
         self.vca_separate_core_bus = bool(vca_separate_core_bus)
         self.vca_bias = bool(vca_bias)
+        # Cell-bound overrides (BO search dims; None -> config defaults).
+        # gm_min/isat_min stay fixed at config defaults (0.01), matching
+        # train_script.py and kn_bayes_opt.py conventions.
+        self.gm_max = float(gm_max) if gm_max is not None else None
+        self.isat_max = float(isat_max) if isat_max is not None else None
 
 
         self.register_buffer("input_log_min", torch.as_tensor(input_log_min, dtype=torch.float32))
@@ -1672,7 +1711,9 @@ class LocalKirchhoffStudentWrapper(nn.Module):
             "read_mode": "dense",
             "use_robust_input": False,
         }
-        cell_lib_template = make_cell_library(cell_library)
+        cell_lib_template = make_cell_library(
+            cell_library, gm_max=self.gm_max, isat_max=self.isat_max,
+        )
         self.net = build_net_from_config(
             cfg,
             cell_lib=cell_lib_template,
@@ -2889,6 +2930,8 @@ student = LocalKirchhoffStudentWrapper(
     vca_gate_shunt=KN_VCA_GATE_SHUNT,
     vca_separate_core_bus=KN_VCA_SEPARATE_CORE_BUS,
     vca_bias=KN_VCA_BIAS,
+    gm_max=KN_GM_MAX,
+    isat_max=KN_ISAT_MAX,
 ).to(DEVICE)
 
 _logger.info(
@@ -2914,8 +2957,8 @@ _logger.info(
     f"small_world_k={KN_SMALL_WORLD_K}, small_world_p={KN_SMALL_WORLD_P}, "
     f"edge_repeats={KN_EDGE_REPEATS}, cell_library={KN_CELL_LIBRARY}, "
     f"leak_mode={KN_LEAK_MODE}, interstage_activation={KN_INTERSTAGE_ACTIVATION}, "
-    f"freeze_read={KN_FREEZE_READ}, temporal_readout={KN_TEMPORAL_READOUT}, input_rail={KN_INPUT_RAIL}, "
-    f"x_max={KN_X_MAX})"
+     f"freeze_read={KN_FREEZE_READ}, temporal_readout={KN_TEMPORAL_READOUT}, input_rail={KN_INPUT_RAIL}, "
+     f"x_max={KN_X_MAX}, gm_max={KN_GM_MAX}, isat_max={KN_ISAT_MAX})"
 )
 _n_trainable = sum(p.numel() for p in student.parameters() if p.requires_grad)
 _logger.info(f"Student trainable params: {_n_trainable:,}")
@@ -3031,6 +3074,71 @@ if ckpt is not None:
         ckpt = None
         distillation_dataset = None
 
+# ── Canonical Phase-A gate (plan canonical-ctle-unify) ─────────────────────
+# Placed BEFORE the initial-dataset build so Phase-A trials never pay for the
+# (expensive) DAgger teacher labelling.  If --canonical-dataset is passed (or
+# --prepare-canonical-dataset), the DAgger loop is bypassed entirely: the
+# static-data, Huber-only Phase-A training mode lets the BO drivers run a
+# fully teacher-comparable, distribution-stationary CTLE inverse benchmark.
+if _bo_args.prepare_canonical_dataset is not None or _bo_args.canonical_dataset is not None:
+    from ctle_dagger_common import (create_canonical_flow_dataset,
+                                     load_canonical_flow_dataset, run_phase_a_training,
+                                     init_output_affine_bias_from_labels)
+    if _bo_args.prepare_canonical_dataset is not None:
+        target_path = Path(_bo_args.prepare_canonical_dataset)
+        if target_path.exists() and not _bo_args.canonical_dataset:
+            _logger.info(f"[phaseA] canonical dataset already exists at {target_path}; loading instead")
+            canonical = load_canonical_flow_dataset(target_path)
+        else:
+            teacher_labeler = FlowTeacherLabeler(TEACHER_DIR, DEVICE)
+            canonical = create_canonical_flow_dataset(
+                df, teacher_labeler=teacher_labeler,
+                n_samples=int(_bo_args.phase_a_n_samples),
+                boundary_ratio=float(_bo_args.phase_a_boundary_ratio),
+                seed=int(_bo_args.seed if _bo_args.seed is not None else 100),
+                output_path=target_path,
+            )
+        if not _bo_args.canonical_dataset:
+            _logger.info("[phaseA] --prepare-canonical-dataset set: exiting before training")
+            sys.exit(0)
+    if _bo_args.canonical_dataset is not None:
+        canonical = load_canonical_flow_dataset(_bo_args.canonical_dataset)
+        train_idx = np.asarray(canonical["train_idx"], dtype=np.int64)
+        init_output_affine_bias_from_labels(
+            student, np.asarray(canonical["params"])[train_idx],
+        )
+        phase_a_epochs = int(_bo_args.phase_a_epochs if _bo_args.phase_a_epochs is not None
+                              else _bo_args.epochs_per_iter if _bo_args.epochs_per_iter is not None
+                              else EPOCHS_PER_ITER)
+        ctx_phase_a = {
+            "DEVICE": DEVICE, "scaler_X": scaler_X, "scaler_y_p": scaler_y_p,
+            "zig_model": zig_model,
+            "eye_scale_h": eye_scale_h, "eye_scale_w": eye_scale_w, "eye_scale_j": eye_scale_j,
+            "canonical_dataset": canonical,
+            "epochs": phase_a_epochs,
+            "batch_size": int(_bo_args.batch_size if _bo_args.batch_size is not None else BATCH_SIZE),
+            "lr": float(_bo_args.lr if _bo_args.lr is not None else LR_INITIAL),
+            "weight_decay": float(_bo_args.weight_decay if _bo_args.weight_decay is not None else WEIGHT_DECAY),
+            "output_dir": OUTPUT_DIR,
+            "grad_clip": 1.0,
+            "val_eval_every": int(_bo_args.earlystop_eval_every if _bo_args.earlystop_eval_every is not None
+                                   else EARLYSTOP_EVAL_EVERY),
+            "earlystop_patience": int(EARLYSTOP_PATIENCE_EPOCHS),
+            "error_threshold": ERROR_THRESHOLD,
+            "input_preprocessing": "knet",
+            "mapper_lr_scale": float(_bo_args.kn_mapper_lr_scale),
+            "struct_lr_scale": float(_bo_args.kn_struct_lr_scale),
+            "dyn_lr_scale": float(_bo_args.kn_dyn_lr_scale),
+        }
+        _logger.info(f"[phaseA] canonical-dataset gate engaged: {len(canonical['specs'])} specs, "
+                     f"epochs={phase_a_epochs}, batch={ctx_phase_a['batch_size']}, "
+                     f"lr={ctx_phase_a['lr']:.2e}, "
+                     f"diff-LR scales mapper/struct/dyn="
+                     f"{_bo_args.kn_mapper_lr_scale}/{_bo_args.kn_struct_lr_scale}/{_bo_args.kn_dyn_lr_scale}")
+        run_phase_a_training(student, ctx_phase_a, model_name="phase_a_knet")
+        _logger.info("[phaseA] canonical-dataset gate: training complete; exiting before DAgger body")
+        sys.exit(0)
+
 # ── Initial dataset ──────────────────────────────────────────────────
 if ckpt is not None:
     pass  # already restored above
@@ -3094,6 +3202,7 @@ else:
         _logger.warning(f"[CKPT] Failed to write baseline checkpoint: {e}")
 
 train_loader = distillation_dataset.get_loader(batch_size=BATCH_SIZE, shuffle=True, hard_weight=10.0)
+
 val_loader = distillation_dataset.get_val_loader(batch_size=BATCH_SIZE)
 _logger.info(f"Train: {len(distillation_dataset._train_indices)}, "
              f"Val: {len(distillation_dataset._val_indices)}")

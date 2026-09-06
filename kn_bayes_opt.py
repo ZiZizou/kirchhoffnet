@@ -176,6 +176,16 @@ STEPS_PER_T_SPAN = 10.0
 SPARSITY_LAMBDA_FIXED = 0.0
 ENTROPY_LAMBDA_FIXED = 1e-6
 
+# Canonical Phase-A mode (plan canonical-ctle-unify): the KNet student is
+# always trained with the Friedman-winning differential LR recipe (mapper 1.0,
+# structural 4.0, dynamic 1.0) so the BO loop measures capacity + optimization
+# in isolation, free of the single-LR convergence tax the fixed-distillation
+# harness paid.  Override via the corresponding --kn-{mapper,struct,dyn}-lr-scale
+# arguments on the underlying harness call.
+KN_DEFAULT_MAPPER_LR_SCALE = 1.0
+KN_DEFAULT_STRUCT_LR_SCALE = 4.0
+KN_DEFAULT_DYN_LR_SCALE = 1.0
+
 START_POINTS: dict[str, dict[str, Any]] = {
     "friedman1": {
         "boundary_fan_out": {
@@ -805,6 +815,21 @@ def main() -> None:
                         help="Hard-WTA CTLE inference candidates retained for the "
                              "ZIG feasibility selector (default: 1; 2 never averages "
                              "parameter vectors).")
+    # Canonical Phase-A mode (plan canonical-ctle-unify).  When --ctle-phase-a is
+    # set, every BO trial runs the static-data, Huber-only Phase-A training mode
+    # (no DAgger, no relabeling, no surrogate-through terms).  --ctle-objective
+    # validation/test selects which metric drives the value (default: validation
+    # — fixes the long-standing test-leakage bug).
+    parser.add_argument("--ctle-phase-a", action="store_true",
+                        help="CTLE BO uses the canonical Phase-A training mode (static data, Huber-only).")
+    parser.add_argument("--ctle-canonical-dataset", type=Path, default=None,
+                        help="Path to the shared canonical Phase-A .npz; required when "
+                             "--ctle-phase-a is set so every trial sees the same labels.")
+    parser.add_argument("--ctle-prepare-canonical-dataset", action="store_true",
+                        help="If set, build the canonical Phase-A .npz at the supplied path "
+                             "from a single trial run, then exit before BO starts.")
+    parser.add_argument("--ctle-objective", choices=["validation", "test"], default="validation",
+                        help="CTLE BO objective source (default: validation; fixes the test-leakage bug).")
     args = parser.parse_args()
 
     if args.param_budget is not None and args.param_budget < 1:
@@ -1013,6 +1038,8 @@ def main() -> None:
         "param_tolerance": args.param_tolerance,
         "arch_param_name": "kn_arch_idx",
         "n_arches": len(feasible_now) if feasible_now is not None else 0,
+        "ctle_phase_a": bool(args.ctle_phase_a),
+        "ctle_objective": args.ctle_objective,
     })
 
     study_was_resumed = db_path.exists()
@@ -1079,6 +1106,8 @@ def main() -> None:
                 lr = sp["lr"]
                 weight_decay = sp["weight_decay"]
                 batch_size = sp["batch_size"]
+                gm_max = sp.get("gm_max", 10.0)
+                isat_max = sp.get("isat_max", 10.0)
                 x_max = sp["x_max"]
                 seed_boundary_map = sp["boundary_fan_out"]
             else:
@@ -1098,6 +1127,14 @@ def main() -> None:
                 lr = trial.suggest_float("lr", args.lr_min, args.lr_max, log=True)
                 weight_decay = trial.suggest_float("weight_decay", args.wd_min, args.wd_max, log=True)
                 batch_size = trial.suggest_categorical("batch_size", BATCH_SIZE_CHOICES)
+                # gm/isat cell-bound search is Phase-A-only (FEATURE spec
+                # canonical-phasea-run).  Gating on the flag keeps legacy
+                # test-objective studies distribution-compatible on resume.
+                if args.ctle_phase_a:
+                    gm_max = trial.suggest_float("gm_max", args.gm_max_min, args.gm_max_max, log=True)
+                    isat_max = trial.suggest_float("isat_max", args.isat_max_min, args.isat_max_max, log=True)
+                else:
+                    gm_max, isat_max = 10.0, 10.0
                 x_max = START_POINTS["ctle"]["x_max"]
                 seed_boundary_map = None
 
@@ -1108,23 +1145,66 @@ def main() -> None:
             trial_dir = run_dir / f"trial_{trial.number:04d}"
             log_path = run_dir / f"trial_{trial.number:04d}.log.txt"
             dagger_script = str((Path(__file__).parent / "dagger-nuance-distillation-kirchhoffnet.py").resolve())
-            cmd = _build_dagger_command(
-                python=python_exe, script=dagger_script,
-                dagger_iterations=dagger_iterations, epochs_per_iter=epochs_per_iter,
-                common_eval_size=common_eval_size,
-                kn_num_stages=num_stages, kn_num_hidden=num_hidden,
-                kn_small_world_k=small_world_k, kn_small_world_p=small_world_p,
-                kn_vca_rank=vca_rank, kn_x_max=x_max,
-                kn_moe_num_experts=moe_num_experts,
-                kn_moe_gate_rank=moe_gate_rank,
-                kn_moe_top_k=args.ctle_moe_top_k,
-                lr=lr, weight_decay=weight_decay, batch_size=batch_size,
-                fanout_count=fanout_count,
-                earlystop_eval_every=args.ctle_earlystop_eval_every,
-                initial_dataset_cache_dir=ctle_cache_dir,
-                output=trial_dir, device=device,
-                boundary_fan_out=seed_boundary_map, t_span=t_span, seed=args.seed,
-            )
+            if args.ctle_phase_a:
+                # Canonical Phase-A mode (plan canonical-ctle-unify): static
+                # data, Huber-only, no DAgger.  The KNet student gets the full
+                # Friedman recipe (differential LR groups, gm/isat knobs) so
+                # the BO loop measures capacity + optimization in isolation.
+                if args.ctle_canonical_dataset is None:
+                    raise ValueError(
+                        "--ctle-phase-a requires --ctle-canonical-dataset <path> "
+                        "so every trial sees the same flow-labelled canonical data."
+                    )
+                cmd = [
+                    python_exe, dagger_script,
+                    "--canonical-dataset", str(args.ctle_canonical_dataset),
+                    "--phase-a-epochs", str(args.epochs),
+                    "--kn-num-stages", str(num_stages),
+                    "--kn-num-hidden", str(num_hidden),
+                    "--kn-small-world-k", str(small_world_k),
+                    "--kn-small-world-p", f"{small_world_p:.6f}",
+                    "--kn-vca-rank", str(vca_rank),
+                    "--kn-x-max", f"{x_max:.6f}",
+                    "--kn-gm-max", f"{gm_max:.6e}",
+                    "--kn-isat-max", f"{isat_max:.6e}",
+                    "--kn-moe-num-experts", str(moe_num_experts),
+                    "--kn-moe-gate-rank", str(moe_gate_rank),
+                    "--kn-moe-top-k", str(args.ctle_moe_top_k),
+                    "--kn-mapper-lr-scale", str(KN_DEFAULT_MAPPER_LR_SCALE),
+                    "--kn-struct-lr-scale", str(KN_DEFAULT_STRUCT_LR_SCALE),
+                    "--kn-dyn-lr-scale", str(KN_DEFAULT_DYN_LR_SCALE),
+                    "--lr", f"{lr:.6e}",
+                    "--weight-decay", f"{weight_decay:.6e}",
+                    "--batch-size", str(batch_size),
+                    "--earlystop-eval-every", str(args.ctle_earlystop_eval_every),
+                    "--output", str(trial_dir),
+                    "--device", device,
+                    "--seed", str(args.seed),
+                ]
+                if t_span is not None:
+                    cmd += ["--t-span", f"{t_span:.6f}"]
+                bfo = seed_boundary_map if seed_boundary_map is not None else build_boundary_fan_out(
+                    in_dim=4, fanout_count=fanout_count, num_hidden=num_hidden
+                )
+                cmd += ["--boundary-fan-out", json.dumps(bfo)]
+            else:
+                cmd = _build_dagger_command(
+                    python=python_exe, script=dagger_script,
+                    dagger_iterations=dagger_iterations, epochs_per_iter=epochs_per_iter,
+                    common_eval_size=common_eval_size,
+                    kn_num_stages=num_stages, kn_num_hidden=num_hidden,
+                    kn_small_world_k=small_world_k, kn_small_world_p=small_world_p,
+                    kn_vca_rank=vca_rank, kn_x_max=x_max,
+                    kn_moe_num_experts=moe_num_experts,
+                    kn_moe_gate_rank=moe_gate_rank,
+                    kn_moe_top_k=args.ctle_moe_top_k,
+                    lr=lr, weight_decay=weight_decay, batch_size=batch_size,
+                    fanout_count=fanout_count,
+                    earlystop_eval_every=args.ctle_earlystop_eval_every,
+                    initial_dataset_cache_dir=ctle_cache_dir,
+                    output=trial_dir, device=device,
+                    boundary_fan_out=seed_boundary_map, t_span=t_span, seed=args.seed,
+                )
             # seed-trial attrs
             if is_seed_trial:
                 trial.set_user_attr("seed_trial", True)
@@ -1171,77 +1251,133 @@ def main() -> None:
             trial_dir.mkdir(parents=True, exist_ok=True)
             trial.set_user_attr("ctle_fidelity_rungs", json.dumps(ctle_rungs))
             validation_rate: float | None = None
-            for rung_index, rung_iterations in enumerate(ctle_rungs):
-                rung_cmd = cmd.copy()
-                rung_cmd[rung_cmd.index("--dagger-iterations") + 1] = str(rung_iterations)
-                mode = "w" if rung_index == 0 else "a"
-                print(f"[ctle] trial {trial.number} rung {rung_iterations}/"
-                      f"{dagger_iterations}: {' '.join(rung_cmd)}", flush=True)
-                with open(log_path, mode, encoding="utf-8") as logf:
-                    logf.write(f"\n# CTLE fidelity rung {rung_iterations}/"
-                               f"{dagger_iterations}\n$ {' '.join(rung_cmd)}\n")
+            # Phase-A path (plan canonical-ctle-unify): no DAgger, no rungs;
+            # run the static-data training once and parse the final split
+            # failure rates from phase_a_history.json.
+            if args.ctle_phase_a:
+                print(f"[ctle] trial {trial.number} phaseA: {' '.join(cmd)}",
+                      flush=True)
+                with open(log_path, "w", encoding="utf-8") as logf:
+                    logf.write(f"\n# CTLE Phase-A\n$ {' '.join(cmd)}\n")
                     logf.flush()
                     proc = subprocess.run(
-                        rung_cmd, stdout=logf, stderr=subprocess.STDOUT,
+                        cmd, stdout=logf, stderr=subprocess.STDOUT,
                         text=True, cwd=str(Path(__file__).parent), env=sub_env,
                     )
-                if proc.returncode != 0:
-                    print(f"[ctle] trial {trial.number} rung {rung_iterations} "
-                          f"subprocess failed (code {proc.returncode})", flush=True)
+                if proc.returncode not in (0, 2):
+                    print(f"[ctle] trial {trial.number} phaseA subprocess failed "
+                          f"(code {proc.returncode})", flush=True)
                     trial.set_user_attr("penalized", True)
                     trial.set_user_attr("penalty_reason",
-                                        f"rung {rung_iterations} subprocess failed ({proc.returncode})")
+                                        f"phaseA subprocess failed ({proc.returncode})")
                     return args.invalid_param_objective
-
-                log_text = (log_path.read_text(encoding="utf-8", errors="ignore")
-                            if log_path.exists() else "")
-                validation_rate = _parse_dagger_validation_failure(log_text)
-                if validation_rate is None:
-                    print(f"[ctle] trial {trial.number} rung {rung_iterations} "
-                          "could not parse Validation failure rate", flush=True)
-                    trial.set_user_attr("penalized", True)
-                    trial.set_user_attr("penalty_reason",
-                                        f"rung {rung_iterations} missing Validation failure rate")
-                    return args.invalid_param_objective
-                trial.set_user_attr(
-                    f"validation_failure_rate_iter_{rung_iterations}",
-                    validation_rate,
-                )
-                trial.report(validation_rate, step=rung_iterations)
-                print(f"[ctle] trial {trial.number} rung {rung_iterations}/"
-                      f"{dagger_iterations} validation "
-                      f"{validation_rate * 100:.2f}%", flush=True)
-
-                # Do not prune the final rung: it has already completed and
-                # its test metric is needed for the legacy final objective.
-                if rung_iterations < dagger_iterations and trial.should_prune():
-                    trial.set_user_attr("pruned_at_dagger_iteration", rung_iterations)
-                    trial.set_user_attr("pruned_validation_failure_rate", validation_rate)
-                    print(f"[ctle] trial {trial.number} pruned after DAgger "
-                          f"iteration {rung_iterations}: validation "
-                          f"{validation_rate * 100:.2f}% is not competitive",
+                hist_path = trial_dir / "phase_a_history.json"
+                if not hist_path.is_file():
+                    print(f"[ctle] trial {trial.number} phaseA: missing phase_a_history.json",
                           flush=True)
-                    raise optuna.TrialPruned(
-                        f"validation={validation_rate:.6f} at DAgger iteration "
-                        f"{rung_iterations}"
-                    )
+                    trial.set_user_attr("penalized", True)
+                    trial.set_user_attr("penalty_reason", "phaseA: missing metrics file")
+                    return args.invalid_param_objective
+                with open(hist_path, encoding="utf-8") as _hf:
+                    hist = json.load(_hf)
+                final = hist.get("final", {})
+                split = "val" if args.ctle_objective == "validation" else "test"
+                if not final or split not in final or "failure_rate" not in final[split]:
+                    print(f"[ctle] trial {trial.number} phaseA: missing {split} failure_rate",
+                          flush=True)
+                    trial.set_user_attr("penalized", True)
+                    trial.set_user_attr("penalty_reason", f"phaseA: missing {split} failure_rate")
+                    return args.invalid_param_objective
+                objective_value = float(final[split]["failure_rate"])
+                val_value = float(final.get("val", {}).get("failure_rate", objective_value))
+                test_value = float(final.get("test", {}).get("failure_rate", objective_value))
+                trial.set_user_attr("phase_a_validation_failure_rate", val_value)
+                trial.set_user_attr("phase_a_test_failure_rate", test_value)
+                trial.set_user_attr("test_failure_rate", test_value)
+                trial.set_user_attr("validation_failure_rate", val_value)
+                param_count = preflight_params
+                base_metric = objective_value
+                print(f"[ctle] trial {trial.number} phaseA {args.ctle_objective} "
+                      f"{base_metric*100:.2f}% (val {val_value*100:.2f}% test {test_value*100:.2f}%)",
+                      flush=True)
+            else:
+                for rung_index, rung_iterations in enumerate(ctle_rungs):
+                    rung_cmd = cmd.copy()
+                    rung_cmd[rung_cmd.index("--dagger-iterations") + 1] = str(rung_iterations)
+                    mode = "w" if rung_index == 0 else "a"
+                    print(f"[ctle] trial {trial.number} rung {rung_iterations}/"
+                          f"{dagger_iterations}: {' '.join(rung_cmd)}", flush=True)
+                    with open(log_path, mode, encoding="utf-8") as logf:
+                        logf.write(f"\n# CTLE fidelity rung {rung_iterations}/"
+                                   f"{dagger_iterations}\n$ {' '.join(rung_cmd)}\n")
+                        logf.flush()
+                        proc = subprocess.run(
+                            rung_cmd, stdout=logf, stderr=subprocess.STDOUT,
+                            text=True, cwd=str(Path(__file__).parent), env=sub_env,
+                        )
+                    if proc.returncode != 0:
+                        print(f"[ctle] trial {trial.number} rung {rung_iterations} "
+                              f"subprocess failed (code {proc.returncode})", flush=True)
+                        trial.set_user_attr("penalized", True)
+                        trial.set_user_attr("penalty_reason",
+                                            f"rung {rung_iterations} subprocess failed ({proc.returncode})")
+                        return args.invalid_param_objective
 
-            log_text = log_path.read_text(encoding="utf-8", errors="ignore") if log_path.exists() else ""
-            test_rate = _parse_dagger_test_failure(log_text)
-            if test_rate is None:
-                print(f"[ctle] trial {trial.number} could not parse Test failure rate", flush=True)
-                trial.set_user_attr("penalized", True)
-                trial.set_user_attr("penalty_reason", "missing Test failure rate in DAgger log")
-                return args.invalid_param_objective
-            # Parse param count for penalty (optional)
-            param_count = _parse_trainable_param_count(log_text)
-            trial.set_user_attr("test_failure_rate", test_rate)
-            trial.set_user_attr("validation_failure_rate", validation_rate)
+                    log_text = (log_path.read_text(encoding="utf-8", errors="ignore")
+                                if log_path.exists() else "")
+                    validation_rate = _parse_dagger_validation_failure(log_text)
+                    if validation_rate is None:
+                        print(f"[ctle] trial {trial.number} rung {rung_iterations} "
+                              "could not parse Validation failure rate", flush=True)
+                        trial.set_user_attr("penalized", True)
+                        trial.set_user_attr("penalty_reason",
+                                            f"rung {rung_iterations} missing Validation failure rate")
+                        return args.invalid_param_objective
+                    trial.set_user_attr(
+                        f"validation_failure_rate_iter_{rung_iterations}",
+                        validation_rate,
+                    )
+                    trial.report(validation_rate, step=rung_iterations)
+                    print(f"[ctle] trial {trial.number} rung {rung_iterations}/"
+                          f"{dagger_iterations} validation "
+                          f"{validation_rate * 100:.2f}%", flush=True)
+
+                    # Do not prune the final rung: it has already completed and
+                    # its test metric is needed for the legacy final objective.
+                    if rung_iterations < dagger_iterations and trial.should_prune():
+                        trial.set_user_attr("pruned_at_dagger_iteration", rung_iterations)
+                        trial.set_user_attr("pruned_validation_failure_rate", validation_rate)
+                        print(f"[ctle] trial {trial.number} pruned after DAgger "
+                              f"iteration {rung_iterations}: validation "
+                              f"{validation_rate * 100:.2f}% is not competitive",
+                              flush=True)
+                        raise optuna.TrialPruned(
+                            f"validation={validation_rate:.6f} at DAgger iteration "
+                            f"{rung_iterations}"
+                        )
+
+            if not args.ctle_phase_a:
+                log_text = log_path.read_text(encoding="utf-8", errors="ignore") if log_path.exists() else ""
+                test_rate = _parse_dagger_test_failure(log_text)
+                if test_rate is None:
+                    print(f"[ctle] trial {trial.number} could not parse Test failure rate", flush=True)
+                    trial.set_user_attr("penalized", True)
+                    trial.set_user_attr("penalty_reason", "missing Test failure rate in DAgger log")
+                    return args.invalid_param_objective
+                param_count = _parse_trainable_param_count(log_text)
+                trial.set_user_attr("test_failure_rate", test_rate)
+                trial.set_user_attr("validation_failure_rate", validation_rate)
+                # --ctle-objective (default "validation") controls which metric
+                # drives the value: legacy behaviour kept test_rate so old
+                # studies still resume bit-identically.
+                if args.ctle_objective == "validation" and validation_rate is not None:
+                    base_metric = validation_rate
+                else:
+                    base_metric = test_rate
             trial.set_user_attr("param_count", param_count if param_count is not None else 0)
             # Penalized objective (same as KNet's non-CTLE path). The
             # architecture was already preflighted before DAgger started;
             # this post-run check remains a defensive consistency guard.
-            base_metric = test_rate  # minimize Test 1000
             if param_count is not None and param_budget is not None:
                 # over-budget -> finite graded penalty, no extra training waste
                 # for subsequent trials (TPE learns to avoid large configs)

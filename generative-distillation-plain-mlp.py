@@ -23,6 +23,7 @@ import subprocess
 import sys
 import time
 import warnings
+from pathlib import Path
 
 import numpy as np
 import torch
@@ -31,7 +32,7 @@ warnings.filterwarnings("ignore")
 
 from ctle_dagger_common import (  # noqa: E402
     PlainMLP, plain_param_count, derive_plain_width,
-    PARAM_LOG_BOUNDS,
+    PARAM_LOG_BOUNDS, FlowTeacherLabeler,
     setup, run_dagger_training, _logger,
     DEFAULT_TEACHER_DIR, DEFAULT_DATA_DIR, DEFAULT_OUTPUT_DIR,
     Timer,
@@ -84,6 +85,19 @@ def parse_args():
                         help="Build the student (honoring --param-budget derivation), print "
                              "TRAINABLE_PARAMS=<n> to stdout and exit before loading teacher "
                              "artifacts or training (Bayes-opt preflight hook).")
+    # Canonical Phase-A flags (plan canonical-ctle-unify).  When --canonical-dataset
+    # is passed, the script bypasses DAgger and runs the static-data, Huber-only
+    # Phase-A training mode (no relabeling, no surrogate-through terms).
+    parser.add_argument("--canonical-dataset", type=str, default=None,
+                        help="Path to canonical Phase-A .npz (specs + flow labels).")
+    parser.add_argument("--prepare-canonical-dataset", type=str, default=None,
+                        help="Path to write the canonical Phase-A .npz and exit (no training).")
+    parser.add_argument("--phase-a-epochs", type=int, default=None,
+                        help="Phase-A training epochs (default: same as --epochs-per-iter).")
+    parser.add_argument("--phase-a-boundary-ratio", type=float, default=0.5,
+                        help="Boundary ratio used when preparing the canonical dataset.")
+    parser.add_argument("--phase-a-n-samples", type=int, default=20000,
+                        help="Number of specs in the canonical dataset.")
     return parser.parse_args()
 
 
@@ -209,6 +223,59 @@ def main():
         print(f"USE_LOG_FEATURES={student.use_log_features}")
         return
     ctx = setup(args)
+
+    # ── Canonical Phase-A gate (plan canonical-ctle-unify) ─────────────────
+    if args.canonical_dataset is not None or args.prepare_canonical_dataset is not None:
+        from ctle_dagger_common import (create_canonical_flow_dataset,
+                                        load_canonical_flow_dataset, run_phase_a_training)
+        if args.prepare_canonical_dataset is not None:
+            target_path = Path(args.prepare_canonical_dataset)
+            if target_path.exists() and not args.canonical_dataset:
+                _logger.info(f"[phaseA] canonical dataset already exists at {target_path}; loading")
+                canonical = load_canonical_flow_dataset(target_path)
+            else:
+                teacher_labeler = FlowTeacherLabeler(args.teacher_dir,
+                                                    torch.device(args.device if args.device != 'auto'
+                                                                else ('cuda' if torch.cuda.is_available() else 'cpu')))
+                canonical = create_canonical_flow_dataset(
+                    ctx["df"], teacher_labeler=teacher_labeler,
+                    n_samples=int(args.phase_a_n_samples),
+                    boundary_ratio=float(args.phase_a_boundary_ratio),
+                    seed=int(args.seed),
+                    output_path=target_path,
+                )
+            if not args.canonical_dataset:
+                _logger.info("[phaseA] --prepare-canonical-dataset set: exiting before training")
+                return
+        if args.canonical_dataset is not None:
+            canonical = load_canonical_flow_dataset(args.canonical_dataset)
+            phase_a_epochs = int(args.phase_a_epochs if args.phase_a_epochs is not None
+                                  else (args.epochs_per_iter or 100))
+            ctx_phase_a = {
+                "DEVICE": ctx["DEVICE"], "scaler_X": ctx["scaler_X"],
+                "scaler_y_p": ctx["scaler_y_p"], "zig_model": ctx["zig_model"],
+                "eye_scale_h": ctx["eye_scale_h"], "eye_scale_w": ctx["eye_scale_w"],
+                "eye_scale_j": ctx["eye_scale_j"],
+                "canonical_dataset": canonical,
+                "epochs": phase_a_epochs,
+                "batch_size": int(args.batch_size or 256),
+                "lr": float(args.lr or 1e-3),
+                "weight_decay": float(args.weight_decay or 1e-4),
+                "output_dir": args.output,
+                "grad_clip": 1.0,
+                "val_eval_every": int(args.earlystop_eval_every or 1),
+                "earlystop_patience": 30,
+                "error_threshold": 0.10,
+                "input_preprocessing": args.input_preprocessing,
+                "input_log_min": getattr(student, "input_log_min", None),
+                "input_log_max": getattr(student, "input_log_max", None),
+            }
+            _logger.info(f"[phaseA] canonical-dataset gate engaged: {len(canonical['specs'])} specs, "
+                         f"epochs={phase_a_epochs}, batch={ctx_phase_a['batch_size']}, "
+                         f"lr={ctx_phase_a['lr']:.2e}")
+            run_phase_a_training(student, ctx_phase_a, model_name='phase_a_plain')
+            _logger.info("[phaseA] canonical-dataset gate: training complete; exiting before DAgger body")
+            return
 
     with Timer("plain-mlp DAgger training"):
         result = run_dagger_training(student, ctx, model_name='dagger_student_plain')

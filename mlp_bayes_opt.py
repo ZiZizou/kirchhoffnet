@@ -370,6 +370,22 @@ def main() -> None:
     parser.add_argument("--ctle-earlystop-eval-every", type=int, default=5,
                         help="Evaluate CTLE common failure rate every N epochs "
                              "(default: 5; final epoch is always evaluated).")
+    # Canonical Phase-A mode (plan canonical-ctle-unify).  When --ctle-phase-a is
+    # set, every BO trial runs the static-data, Huber-only Phase-A training
+    # mode (no DAgger, no relabeling, no surrogate-through terms).  The
+    # validation ZIG failure rate becomes the Optuna value (test reserved for
+    # the selected-final refit).  --ctle-objective validation/test selects
+    # which log line drives the value.
+    parser.add_argument("--ctle-phase-a", action="store_true",
+                        help="CTLE BO uses the canonical Phase-A training mode (static data, Huber-only).")
+    parser.add_argument("--ctle-canonical-dataset", type=Path, default=None,
+                        help="Path to the shared canonical Phase-A .npz; required when "
+                             "--ctle-phase-a is set so every trial sees the same labels.")
+    parser.add_argument("--ctle-prepare-canonical-dataset", action="store_true",
+                        help="If set, build the canonical Phase-A .npz at the supplied path "
+                             "from a single trial run, then exit before BO starts.")
+    parser.add_argument("--ctle-objective", choices=["validation", "test"], default="validation",
+                        help="CTLE BO objective source (default: validation; fixes the test-leakage bug).")
     args = parser.parse_args()
 
     if args.param_tolerance < 0.0:
@@ -432,6 +448,8 @@ def main() -> None:
         "input_preprocessing": args.input_preprocessing,
         "arch_param_name": "moe_arch_idx" if args.dataset == "ctle" else "mlp_arch_idx",
         "n_arches": (len(moe_feasible) if args.dataset == "ctle" else len(plain_feasible)),
+        "ctle_phase_a": bool(args.ctle_phase_a),
+        "ctle_objective": args.ctle_objective,
     })
     if args.resume and (run_dir / (study_name + ".db")).exists():
         study = optuna.load_study(study_name=study_name, storage=storage,
@@ -575,24 +593,51 @@ def main() -> None:
                                     f"expected params={expected_params} > soft cap {soft_limit}")
                 return _over_budget_objective(
                     expected_params, soft_limit, args.invalid_param_objective)
-            # 4×100 proxy: 4 DAgger iterations × 100 epochs, common-eval 1000 for speed
-            cmd = [
-                python_exe, str(script_path),
-                "--dagger-iterations", str(args.ctle_dagger_iterations),
-                "--epochs-per-iter", str(args.ctle_epochs_per_iter),
-                "--common-eval-size", str(args.ctle_common_eval_size),
-                "--earlystop-eval-every", str(args.ctle_earlystop_eval_every),
-                "--moe-trunk-width", str(trunk_width),
-                "--moe-trunk-layers", str(trunk_layers),
-                "--moe-num-experts", str(num_experts),
-                "--lr", f"{lr:.6e}",
-                "--weight-decay", f"{weight_decay:.6e}",
-                "--batch-size", str(batch_size),
-                "--output", str(trial_dir),
-                "--device", device,
-                "--seed", str(args.seed),
-                "--input-preprocessing", args.input_preprocessing,
-            ]
+            # Phase-A mode (plan canonical-ctle-unify): static data, Huber-only,
+            # bypass DAgger, shared canonical .npz.  Validation failure is the
+            # default objective; --ctle-objective test re-enables the test metric
+            # for direct comparability with the legacy DAgger logs.
+            if args.ctle_phase_a:
+                if args.ctle_canonical_dataset is None:
+                    raise ValueError(
+                        "--ctle-phase-a requires --ctle-canonical-dataset <path> "
+                        "so every trial sees the same flow-labelled canonical data."
+                    )
+                cmd = [
+                    python_exe, str(script_path),
+                    "--canonical-dataset", str(args.ctle_canonical_dataset),
+                    "--phase-a-epochs", str(args.epochs),
+                    "--moe-trunk-width", str(trunk_width),
+                    "--moe-trunk-layers", str(trunk_layers),
+                    "--moe-num-experts", str(num_experts),
+                    "--lr", f"{lr:.6e}",
+                    "--weight-decay", f"{weight_decay:.6e}",
+                    "--batch-size", str(batch_size),
+                    "--earlystop-eval-every", str(args.ctle_earlystop_eval_every),
+                    "--output", str(trial_dir),
+                    "--device", device,
+                    "--seed", str(args.seed),
+                    "--input-preprocessing", args.input_preprocessing,
+                ]
+            else:
+                # 4×100 DAgger proxy (legacy path)
+                cmd = [
+                    python_exe, str(script_path),
+                    "--dagger-iterations", str(args.ctle_dagger_iterations),
+                    "--epochs-per-iter", str(args.ctle_epochs_per_iter),
+                    "--common-eval-size", str(args.ctle_common_eval_size),
+                    "--earlystop-eval-every", str(args.ctle_earlystop_eval_every),
+                    "--moe-trunk-width", str(trunk_width),
+                    "--moe-trunk-layers", str(trunk_layers),
+                    "--moe-num-experts", str(num_experts),
+                    "--lr", f"{lr:.6e}",
+                    "--weight-decay", f"{weight_decay:.6e}",
+                    "--batch-size", str(batch_size),
+                    "--output", str(trial_dir),
+                    "--device", device,
+                    "--seed", str(args.seed),
+                    "--input-preprocessing", args.input_preprocessing,
+                ]
             t0 = time.time()
             sub_env = os.environ.copy()
             sub_env.setdefault("PYTHONIOENCODING", "utf-8")
@@ -612,13 +657,36 @@ def main() -> None:
                 return _over_budget_objective(soft_limit + 1, soft_limit,
                                               args.invalid_param_objective)
             text = log_path.read_text(encoding="utf-8", errors="ignore")
-            m = re.search(r"Test failure rate:\s*([\d\.]+)%", text)
-            if not m:
+            # Parse the requested objective.  Phase-A logs the final per-split
+            # failure rates in ``phase_a_history.json``; legacy DAgger writes
+            # them inline as ``Validation failure rate: X%`` and
+            # ``Test failure rate: X%``.
+            objective_value = None
+            if args.ctle_phase_a:
+                import json as _json
+                hist_path = trial_dir / "phase_a_history.json"
+                if hist_path.is_file():
+                    with open(hist_path, encoding="utf-8") as _hf:
+                        hist = _json.load(_hf)
+                    split = "val" if args.ctle_objective == "validation" else "test"
+                    if "final" in hist and split in hist["final"]:
+                        objective_value = float(hist["final"][split]["failure_rate"])
+            else:
+                if args.ctle_objective == "validation":
+                    vm = re.search(r"Validation failure rate:\s*([\d\.]+)%", text)
+                    if vm:
+                        objective_value = float(vm.group(1)) / 100.0
+                if objective_value is None:
+                    m = re.search(r"Test failure rate:\s*([\d\.]+)%", text)
+                    if m:
+                        objective_value = float(m.group(1)) / 100.0
+            if objective_value is None:
                 trial.set_user_attr("penalized", True)
-                trial.set_user_attr("penalty_reason", "missing Test failure rate in log")
+                trial.set_user_attr("penalty_reason",
+                                    f"missing {args.ctle_objective} failure rate in log")
                 return _over_budget_objective(soft_limit + 1, soft_limit,
                                               args.invalid_param_objective)
-            test_rate = float(m.group(1)) / 100.0
+            test_rate = objective_value
             # Parse actual param count for --param-budget penalty (mlp dagger logs "Student model: X params")
             pm = re.search(r"Student model:\s*([0-9,]+)\s*params", text)
             if pm is None:

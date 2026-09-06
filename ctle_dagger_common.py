@@ -30,6 +30,7 @@ import torch.nn.functional as F
 import torch.distributions as dist
 from torch.utils.data import Dataset, DataLoader, WeightedRandomSampler, Subset
 from sklearn.neighbors import NearestNeighbors
+import hashlib
 
 import matplotlib
 
@@ -1792,6 +1793,209 @@ def create_flow_distillation_dataset(df, n_samples=10000, n_candidates=5000,
     return data_list
 
 
+# ---------------------------------------------------------------------------
+# Canonical Phase-A dataset builder (plan canonical-ctle-unify)
+# ---------------------------------------------------------------------------
+# Frozen min-power tie-break rule:
+#   1. Flow samples `top_k=8` candidate param vectors per spec.
+#   2. Keep only candidates with surrogate-validity >= 0.9, or (relaxed fallback)
+#      >= 0.5 if no candidate clears the strict gate.
+#   3. Among the surviving ZIG-valid candidates, pick the one whose predicted
+#      forward power `4*VDD*I` is smallest (min-power tie-break; min-power is
+#      the industrial objective for CTLE).
+# The rule is chosen on physical grounds (lowest-power viable design) and is
+# frozen before either Phase-A BO run; never tuned per student.
+# Spec: docs/specs/canonical-ctle-bench.md (canonical-ctle-unify).
+PHASE_A_TIE_BREAK = "min_power"
+PHASE_A_TOP_K = 8
+PHASE_A_VALID_THRESHOLD = 0.9
+PHASE_A_RELAXED_THRESHOLD = 0.5
+
+_PHASE_A_FEATURE_ORDER = ("power", "stage_2_jitter", "stage_2_eye_max_height", "stage_2_eye_max_width")
+
+
+def _predict_forward_power(params_arr: np.ndarray) -> np.ndarray:
+    """Estimate surrogate forward power (W) for min-power tie-break.
+
+    Uses the same 4*VDD*I approximation the flow teacher's physics-penalty
+    term relies on (`ctle_dagger_common.py` sample_and_rank).  Indices are
+    PARAM_COLS order: fW(0), current(1), ind(2), Rd(3), Cs(4), Rs(5), VDD(6).
+    """
+    if params_arr.size == 0 or params_arr.shape[-1] < 7:
+        return np.full(params_arr.shape[:-1], np.inf, dtype=np.float64)
+    return 4.0 * params_arr[..., 6] * params_arr[..., 1]
+
+
+def _canonical_dataset_fingerprint(seed: int, teacher_identity: str,
+                                  n_samples: int, boundary_ratio: float,
+                                  top_k: int, valid_threshold: float,
+                                  relaxed_threshold: float, tie_break: str) -> str:
+    payload = {
+        "seed": int(seed),
+        "teacher_identity": str(teacher_identity),
+        "n_samples": int(n_samples),
+        "boundary_ratio": float(boundary_ratio),
+        "top_k": int(top_k),
+        "valid_threshold": float(valid_threshold),
+        "relaxed_threshold": float(relaxed_threshold),
+        "tie_break": str(tie_break),
+        "feature_order": list(_PHASE_A_FEATURE_ORDER),
+    }
+    return hashlib.sha256(
+        json.dumps(payload, sort_keys=True).encode("utf-8")
+    ).hexdigest()
+
+
+def create_canonical_flow_dataset(
+    df,
+    teacher_labeler=None,
+    n_samples: int = 20000,
+    boundary_ratio: float = 0.5,
+    seed: int = 100,
+    n_candidates: int = 5000,
+    top_k: int = PHASE_A_TOP_K,
+    valid_threshold: float = PHASE_A_VALID_THRESHOLD,
+    relaxed_threshold: float = PHASE_A_RELAXED_THRESHOLD,
+    output_path: str | os.PathLike | None = None,
+):
+    """Canonical Phase-A dataset: flow-labelled, min-power tie-break, frozen.
+
+    Returns a dict with the same fields DistillationDataset indexes, plus a
+    sha256 fingerprint and the per-spec predicted forward power (for auditing).
+    If ``output_path`` is given, also writes a compressed .npz with the same
+    schema (specs, params_log, predicted_power, fingerprint, train_idx/val_idx/test_idx)
+    that both BO drivers and all harnesses load identically.
+
+    The dataset is **static**: every trial sees byte-identical labels and
+    splits.  No DAgger relabeling is performed; loss is Huber-on-log-params
+    only (the rest of the RegimeAwareLoss machinery is held out so that
+    Phase A isolates model capacity + optimization from surrogate-gradient
+    credit assignment).
+    """
+    if teacher_labeler is None:
+        teacher_labeler = FlowTeacherLabeler(
+            DEFAULT_TEACHER_DIR,
+            torch.device("cuda" if torch.cuda.is_available() else "cpu"),
+        )
+
+    specs_arr = sample_validation_specs(
+        df, n_samples=n_samples, boundary_ratio=boundary_ratio, seed=seed
+    )
+    _logger.info(
+        f"[phaseA] sampling {len(specs_arr)} specs "
+        f"(boundary_ratio={boundary_ratio}, seed={seed}); flow top_k={top_k}"
+    )
+
+    # Use :meth:`label_single` per spec so the top_k candidates are
+    # returned as (top_k, 7) without relying on :meth:`label_batch`, which
+    # is currently hard-coded for top_k=1 and would route a 3D candidate
+    # tensor through a 2D-only StandardScaler inside filter_by_zig_validity.
+    # For the canonical builder this is the deterministic, self-contained
+    # path; the existing DAgger ``label_batch(top_k=1)`` calls are unchanged.
+    labels_topk = np.zeros((len(specs_arr), top_k, 7), dtype=np.float64)
+    for i in range(len(specs_arr)):
+        top = teacher_labeler.label_single(
+            specs_arr[i], n_candidates=n_candidates,
+            valid_threshold=valid_threshold, top_k=top_k,
+        )
+        labels_topk[i] = np.asarray(top, dtype=np.float64).reshape(top_k, 7)
+
+    zig_model = _active_zig()
+    scaler_X = _active_scalers()[0]
+    device = _active_device()
+    n_invalid = 0
+    n_relaxed = 0
+    chosen = np.zeros((len(specs_arr), 7), dtype=np.float64)
+    predicted_power = np.zeros(len(specs_arr), dtype=np.float64)
+    for i in range(len(specs_arr)):
+        cands = labels_topk[i]
+        keep = filter_by_zig_validity(
+            cands, zig_model, scaler_X, threshold=valid_threshold, device=device,
+        )
+        if not keep.any():
+            keep = filter_by_zig_validity(
+                cands, zig_model, scaler_X, threshold=relaxed_threshold, device=device,
+            )
+            n_relaxed += int(keep.sum())
+        if not keep.any():
+            chosen[i] = cands[0]
+            n_invalid += 1
+            predicted_power[i] = _predict_forward_power(chosen[i:i + 1])[0]
+            continue
+        cands_valid = cands[keep]
+        power = _predict_forward_power(cands_valid)
+        order = np.argsort(power)
+        chosen[i] = cands_valid[order[0]]
+        predicted_power[i] = float(power[order[0]])
+
+    _logger.info(
+        f"[phaseA] tie-break={PHASE_A_TIE_BREAK}: "
+        f"{n_invalid}/{len(specs_arr)} fell back to top-1 flow pick "
+        f"({n_relaxed} candidates needed the {relaxed_threshold} relaxed gate)"
+    )
+
+    teacher_identity = str(getattr(teacher_labeler, "teacher_dir", DEFAULT_TEACHER_DIR))
+    fingerprint = _canonical_dataset_fingerprint(
+        seed=seed,
+        teacher_identity=teacher_identity,
+        n_samples=n_samples,
+        boundary_ratio=boundary_ratio,
+        top_k=top_k,
+        valid_threshold=valid_threshold,
+        relaxed_threshold=relaxed_threshold,
+        tie_break=PHASE_A_TIE_BREAK,
+    )
+
+    rng = np.random.default_rng(seed)
+    perm = rng.permutation(len(specs_arr))
+    n_train = int(0.8 * len(specs_arr))
+    n_val = int(0.1 * len(specs_arr))
+    train_idx = perm[:n_train]
+    val_idx = perm[n_train:n_train + n_val]
+    test_idx = perm[n_train + n_val:]
+    # knet log/min-max input bounds over the canonical specs (+5% pad), mirroring
+    # the fixed-distillation harness.  Students with knet input preprocessing
+    # (KNet, PlainMLPStudent) require these via attach_scaler; storing them in
+    # the .npz keeps every trial byte-identical without recomputation.
+    spec_logs = np.log10(np.clip(specs_arr, 1e-12, None))
+    lo, hi = spec_logs.min(axis=0), spec_logs.max(axis=0)
+    pad = 0.05 * np.maximum(hi - lo, 1e-8)
+    payload = {
+        "specs": specs_arr.astype(np.float32),
+        "params": chosen.astype(np.float32),
+        "predicted_power": predicted_power.astype(np.float32),
+        "fingerprint": np.array(fingerprint),
+        "train_idx": train_idx.astype(np.int64),
+        "val_idx": val_idx.astype(np.int64),
+        "test_idx": test_idx.astype(np.int64),
+        "tie_break": np.array(PHASE_A_TIE_BREAK),
+        "input_log_min": (lo - pad).astype(np.float32),
+        "input_log_max": (hi + pad).astype(np.float32),
+    }
+    if output_path is not None:
+        out = Path(output_path)
+        out.parent.mkdir(parents=True, exist_ok=True)
+        np.savez_compressed(out, **payload)
+        _logger.info(f"[phaseA] wrote canonical dataset -> {out} "
+                     f"(fingerprint={fingerprint[:12]}...)")
+    return payload
+
+
+def load_canonical_flow_dataset(path: str | os.PathLike) -> dict:
+    """Load a canonical Phase-A .npz produced by :func:`create_canonical_flow_dataset`."""
+    p = Path(path)
+    if not p.is_file():
+        raise FileNotFoundError(f"Canonical dataset not found: {p}")
+    npz = np.load(p, allow_pickle=False)
+    required = {"specs", "params", "predicted_power", "fingerprint",
+                "train_idx", "val_idx", "test_idx",
+                "input_log_min", "input_log_max"}
+    missing = required - set(npz.files)
+    if missing:
+        raise RuntimeError(f"Canonical dataset {p} missing fields: {sorted(missing)}")
+    return {key: npz[key] for key in npz.files}
+
+
 def create_blended_distillation_dataset(df, teacher_labeler=None, n_samples=5000, n_candidates=5000,
                                         boundary_ratio=0.3, tolerance=0.05):
     """Creates a dataset where labels are either empirical or flow-generated."""
@@ -2349,6 +2553,395 @@ def train_epoch(student, train_loader, optimizer, criterion, device, loss_weight
         losses['regime'] += regime_loss.item() if regime_loss is not None else 0.0
     n = len(train_loader)
     return {k: float(v/n) for k, v in losses.items()}
+
+
+# ---------------------------------------------------------------------------
+# Phase-A training mode (plan canonical-ctle-unify)
+# ---------------------------------------------------------------------------
+# Static-data, Huber-on-log-params-only training mode for the canonical CTLE
+# benchmark. No DAgger relabeling, no scheduler restarts, no surrogate-through
+# gradient terms — those are deliberately held out so Phase A isolates model
+# capacity + optimization from surrogate-gradient credit assignment. The
+# KNet harness adds the differential-LR-group recipe from the Friedman wins.
+# Spec: docs/specs/canonical-ctle-bench.md + docs/specs/canonical-phasea-run.md.
+
+class _PhaseACanonicalDataset(Dataset):
+    """Static loader for the canonical Phase-A .npz (specs + flow labels)."""
+
+    MAX_PARAMS = 7
+
+    def __init__(self, canonical: dict, split: str):
+        self.specs = np.asarray(canonical["specs"], dtype=np.float32)
+        params = np.asarray(canonical["params"], dtype=np.float32)
+        params_log = np.log10(np.clip(params, 1e-12, None))
+        pad = self.MAX_PARAMS - params_log.shape[-1]
+        if pad > 0:
+            params_log = np.pad(params_log, ((0, 0), (0, pad)), constant_values=-30.0)
+        self.params_log = params_log.astype(np.float32)
+        idx = canonical[f"{split}_idx"]
+        self.indices = np.asarray(idx, dtype=np.int64).tolist()
+
+    def __len__(self):
+        return len(self.indices)
+
+    def __getitem__(self, idx):
+        j = self.indices[idx]
+        specs = torch.from_numpy(self.specs[j])
+        params = torch.from_numpy(self.params_log[j])
+        return specs, params
+
+
+def _phase_a_loaders(canonical: dict, batch_size: int):
+    train_ds = _PhaseACanonicalDataset(canonical, "train")
+    val_ds = _PhaseACanonicalDataset(canonical, "val")
+    test_ds = _PhaseACanonicalDataset(canonical, "test")
+    train_loader = DataLoader(
+        train_ds, batch_size=batch_size, shuffle=True, num_workers=0,
+        pin_memory=torch.cuda.is_available(),
+    )
+    val_loader = DataLoader(
+        val_ds, batch_size=batch_size, shuffle=False, num_workers=0,
+        pin_memory=torch.cuda.is_available(),
+    )
+    test_loader = DataLoader(
+        test_ds, batch_size=batch_size, shuffle=False, num_workers=0,
+        pin_memory=torch.cuda.is_available(),
+    )
+    return train_loader, val_loader, test_loader
+
+
+def run_phase_a_training(student, ctx, *, model_name: str = "phase_a_student"):
+    """Static, single-pass canonical-Phase-A training + ZIG evaluation.
+
+    Parameters expected in ``ctx`` (subset of the DAgger context):
+      - DEVICE, scaler_X, scaler_y_p, zig_model, eye_scale_{h,w,j}
+      - canonical_dataset: dict returned by :func:`create_canonical_flow_dataset`
+        (or loaded via :func:`load_canonical_flow_dataset`)
+      - epochs (int), batch_size (int), lr (float), weight_decay (float)
+      - output_dir (str)
+    Optional:
+      - grad_clip (float, default 1.0)
+      - val_eval_every (int, default 1) — runs StudentEvaluator on the val split
+        every N epochs; the best-failure checkpoint is the one carried forward.
+      - earlystop_patience (int, default 30)
+      - error_threshold (float, default 0.10 — passes through to identify_failures)
+      - mapper_lr_scale / struct_lr_scale / dyn_lr_scale (floats) — KNet Friedman
+        recipe; passed straight to the AdamW group builder.  If absent or 1.0
+        the student is trained with a single AdamW group (safe for MLP).
+    """
+    DEVICE = ctx["DEVICE"]
+    scaler_X = ctx["scaler_X"]
+    scaler_y_p = ctx["scaler_y_p"]
+    zig_model = ctx["zig_model"]
+    eye_scale_h = ctx["eye_scale_h"]
+    eye_scale_w = ctx["eye_scale_w"]
+    eye_scale_j = ctx["eye_scale_j"]
+    canonical = ctx["canonical_dataset"]
+    epochs = int(ctx["epochs"])
+    batch_size = int(ctx["batch_size"])
+    lr = float(ctx["lr"])
+    weight_decay = float(ctx["weight_decay"])
+    output_dir = ctx["output_dir"]
+    grad_clip = float(ctx.get("grad_clip", 1.0))
+    val_eval_every = int(ctx.get("val_eval_every", 1))
+    earlystop_patience = int(ctx.get("earlystop_patience", 30))
+    error_threshold = float(ctx.get("error_threshold", 0.10))
+    mapper_lr_scale = float(ctx.get("mapper_lr_scale", 1.0))
+    struct_lr_scale = float(ctx.get("struct_lr_scale", 1.0))
+    dyn_lr_scale = float(ctx.get("dyn_lr_scale", 1.0))
+    # knet input bounds: explicit ctx wins, else the canonical .npz bounds
+    # (always present since the builder stores them).  Required by
+    # attach_scaler for knet-preprocessing students.
+    input_log_min = ctx.get("input_log_min", None)
+    input_log_max = ctx.get("input_log_max", None)
+    if input_log_min is None and "input_log_min" in canonical:
+        input_log_min = np.asarray(canonical["input_log_min"], dtype=np.float32)
+    if input_log_max is None and "input_log_max" in canonical:
+        input_log_max = np.asarray(canonical["input_log_max"], dtype=np.float32)
+
+    if hasattr(student, "attach_scaler"):
+        student.attach_scaler(
+            scaler_p_scale=scaler_y_p.scale_[0],
+            scaler_p_mean=scaler_y_p.mean_[0],
+            eye_scale_j=eye_scale_j,
+            eye_scale_h=eye_scale_h,
+            eye_scale_w=eye_scale_w,
+            input_preprocessing=ctx.get("input_preprocessing", "q75"),
+            input_log_min=input_log_min,
+            input_log_max=input_log_max,
+        )
+    student = student.to(DEVICE)
+
+    train_loader, val_loader, test_loader = _phase_a_loaders(canonical, batch_size)
+    _logger.info(
+        f"[phaseA] split sizes: train={len(train_loader.dataset)} "
+        f"val={len(val_loader.dataset)} test={len(test_loader.dataset)} "
+        f"epochs={epochs} batch={batch_size} lr={lr:.2e}"
+    )
+
+    optimizer = _build_phase_a_optimizer(
+        student, lr=lr, weight_decay=weight_decay,
+        mapper_lr_scale=mapper_lr_scale,
+        struct_lr_scale=struct_lr_scale,
+        dyn_lr_scale=dyn_lr_scale,
+    )
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, T_max=epochs, eta_min=lr * 0.01,
+    )
+
+    history = {"epoch": [], "train_loss": [], "val_loss": [],
+               "val_failure_rate": [], "val_boundary_failure": [],
+               "val_interior_failure": []}
+    best_val_failure = float("inf")
+    best_state = None
+    best_val_loss = float("inf")
+    best_val_loss_state = None
+    no_improve = 0
+    checkpoint_path = os.path.join(output_dir, "phase_a_last.pt")
+    best_path = os.path.join(output_dir, "phase_a_best.pt")
+    os.makedirs(output_dir, exist_ok=True)
+
+    evaluator = StudentEvaluator(
+        student=student, scaler_X=scaler_X, zig_model=zig_model,
+        eye_scale_h=eye_scale_h, eye_scale_w=eye_scale_w,
+        eye_scale_j=eye_scale_j, scaler_y_p=scaler_y_p, device=DEVICE,
+    )
+
+    for epoch in range(epochs):
+        student.train()
+        total_loss = 0.0
+        n_batches = 0
+        for specs_batch, params_target in train_loader:
+            specs_batch = specs_batch.to(DEVICE)
+            params_target = params_target.to(DEVICE)
+            optimizer.zero_grad(set_to_none=True)
+            logits = student(specs_batch)
+            loss = huber_loss(logits, params_target, delta=0.5).mean()
+            if not torch.isfinite(loss):
+                _logger.warning(
+                    f"[phaseA] non-finite loss at epoch {epoch+1}, batch {n_batches}; skipping"
+                )
+                n_batches += 1
+                continue
+            loss.backward()
+            if grad_clip > 0:
+                torch.nn.utils.clip_grad_norm_(student.parameters(), grad_clip)
+            optimizer.step()
+            total_loss += loss.item()
+            n_batches += 1
+        scheduler.step()
+        avg_train = total_loss / max(1, n_batches)
+        avg_val = _phase_a_huber_eval(student, val_loader, DEVICE)
+        val_failure_rate = float("nan")
+        boundary_failure_rate = float("nan")
+        interior_failure_rate = float("nan")
+        if (epoch + 1) % val_eval_every == 0 or epoch == epochs - 1:
+            evaluator.student = student
+            val_specs = canonical["specs"][np.asarray(canonical["val_idx"], dtype=np.int64)]
+            failure_mask, metrics = evaluator.identify_failures(
+                val_specs, threshold=error_threshold,
+            )
+            val_failure_rate = float(failure_mask.mean())
+            if "boundary_failure" in metrics and "is_boundary" in metrics:
+                bm = metrics["is_boundary"]
+                boundary_failure_rate = float(
+                    metrics["boundary_failure"].sum() / max(1, bm.sum())
+                )
+                interior_failure_rate = float(
+                    metrics["interior_failure"].sum() / max(1, (~bm).sum())
+                )
+        history["epoch"].append(epoch + 1)
+        history["train_loss"].append(avg_train)
+        history["val_loss"].append(avg_val)
+        history["val_failure_rate"].append(val_failure_rate)
+        history["val_boundary_failure"].append(boundary_failure_rate)
+        history["val_interior_failure"].append(interior_failure_rate)
+        if avg_val < best_val_loss:
+            best_val_loss = avg_val
+            best_val_loss_state = {k: v.detach().cpu().clone() for k, v in student.state_dict().items()}
+        if not np.isnan(val_failure_rate) and val_failure_rate < best_val_failure:
+            best_val_failure = val_failure_rate
+            best_state = {k: v.detach().cpu().clone() for k, v in student.state_dict().items()}
+            no_improve = 0
+        else:
+            no_improve += 1
+        torch.save(
+            {"epoch": epoch, "model": student.state_dict(),
+             "optimizer": optimizer.state_dict(), "history": history,
+             "best_val_failure": best_val_failure},
+            checkpoint_path,
+        )
+        if (epoch + 1) % 10 == 0 or epoch == 0 or epoch == epochs - 1:
+            _logger.info(
+                f"[phaseA] epoch {epoch+1:3d}/{epochs}  "
+                f"train_huber={avg_train:.4f}  val_huber={avg_val:.4f}  "
+                f"val_fail={val_failure_rate*100:5.2f}% "
+                f"(bnd={boundary_failure_rate*100:5.2f}% int={interior_failure_rate*100:5.2f}%) "
+                f"best={best_val_failure*100:5.2f}% patience={no_improve}/{earlystop_patience}"
+            )
+        if earlystop_patience > 0 and no_improve >= earlystop_patience:
+            _logger.info(
+                f"[phaseA] early stop: no best-failure improvement in "
+                f"{earlystop_patience} eval cycles; restoring best-failure checkpoint"
+            )
+            break
+
+    if best_state is not None:
+        student.load_state_dict(best_state)
+        student.to(DEVICE)
+        torch.save(best_state, best_path)
+    elif best_val_loss_state is not None:
+        student.load_state_dict(best_val_loss_state)
+        student.to(DEVICE)
+        torch.save(best_val_loss_state, best_path)
+
+    final = {}
+    for split_name, loader in (("train", train_loader), ("val", val_loader), ("test", test_loader)):
+        evaluator.student = student
+        idx_arr = canonical[f"{split_name}_idx"]
+        specs_arr = canonical["specs"][np.asarray(idx_arr, dtype=np.int64)]
+        failure_mask, metrics = evaluator.identify_failures(
+            specs_arr, threshold=error_threshold,
+        )
+        boundary_failure_rate = float("nan")
+        interior_failure_rate = float("nan")
+        if "boundary_failure" in metrics and "is_boundary" in metrics:
+            bm = metrics["is_boundary"]
+            boundary_failure_rate = float(metrics["boundary_failure"].sum() / max(1, bm.sum()))
+            interior_failure_rate = float(metrics["interior_failure"].sum() / max(1, (~bm).sum()))
+        final[split_name] = {
+            "failure_rate": float(failure_mask.mean()),
+            "boundary_failure_rate": boundary_failure_rate,
+            "interior_failure_rate": interior_failure_rate,
+            "dim_fail_rates": (
+                np.asarray(metrics["errors"]) >= float(ctx.get("DEGRADE_REL_THRESHOLD", 0.20))
+            ).mean(axis=0).tolist(),
+        }
+
+    log_path = os.path.join(output_dir, "phase_a_history.json")
+    with open(log_path, "w", encoding="utf-8") as handle:
+        json.dump({"history": history, "final": final, "args": {
+            "epochs": epochs, "batch_size": batch_size, "lr": lr,
+            "weight_decay": weight_decay, "model_name": model_name,
+            "fingerprint": _canonical_fingerprint_str(canonical),
+            "mapper_lr_scale": mapper_lr_scale, "struct_lr_scale": struct_lr_scale,
+            "dyn_lr_scale": dyn_lr_scale,
+        }}, handle, indent=2, default=str)
+    _logger.info(f"[phaseA] wrote {log_path}")
+    _logger.info(
+        f"[phaseA] final failure: train={final['train']['failure_rate']*100:5.2f}% "
+        f"val={final['val']['failure_rate']*100:5.2f}% test={final['test']['failure_rate']*100:5.2f}%"
+    )
+    return {
+        "best_val_failure_rate": float(best_val_failure),
+        "final": final,
+        "history": history,
+        "checkpoint": best_path,
+    }
+
+
+def _canonical_fingerprint_str(canonical: dict) -> str | None:
+    fp = canonical.get("fingerprint", None)
+    if fp is None:
+        return None
+    try:
+        return str(np.asarray(fp).item())
+    except (ValueError, TypeError):
+        return str(fp)
+
+
+def init_output_affine_bias_from_labels(student, train_params_physical: np.ndarray,
+                                        param_log_bounds: dict | None = None) -> bool:
+    """Init a KNet OutputAffine bias to train-label means (Friedman recipe).
+
+    With gain=1 and silent nonlinear branches, ``bias=logit(mean position)``
+    makes the readout start at the dataset mean instead of mid-range, removing
+    a constant offset the ODE would otherwise have to learn.  Returns True when
+    an OutputAffine-style ``output_mapper`` with a 7-dim bias was found and
+    initialised, False otherwise (safe no-op for MLP students).
+    """
+    bounds = param_log_bounds or PARAM_LOG_BOUNDS
+    names = list(bounds.keys())
+    inner = getattr(student, "net", student)
+    mapper = getattr(inner, "output_mapper", None)
+    bias = getattr(mapper, "bias", None)
+    if bias is None or not isinstance(bias, torch.nn.Parameter):
+        return False
+    if bias.numel() != len(names):
+        return False
+    phys = np.asarray(train_params_physical, dtype=np.float64)
+    if phys.ndim != 2 or phys.shape[1] != len(names) or len(phys) == 0:
+        return False
+    logits = np.zeros(len(names), dtype=np.float32)
+    for j, name in enumerate(names):
+        lo, hi = bounds[name]
+        span = hi - lo
+        pos = (np.log10(np.clip(phys[:, j], 1e-12, None)) - lo) / max(span, 1e-8)
+        pos = float(np.clip(pos.mean(), 1e-3, 1.0 - 1e-3))
+        logits[j] = float(np.log(pos / (1.0 - pos)))
+    with torch.no_grad():
+        bias.data = torch.as_tensor(logits, dtype=bias.dtype, device=bias.device)
+    _logger.info(
+        "[phaseA] OutputAffine bias initialised to train-label means: "
+        + ", ".join(f"{n}={v:+.3f}" for n, v in zip(names, logits))
+    )
+    return True
+
+
+def _phase_a_huber_eval(student, val_loader, device):
+    student.eval()
+    total_loss = 0.0
+    n_batches = 0
+    with torch.no_grad():
+        for specs_batch, params_target in val_loader:
+            specs_batch = specs_batch.to(device)
+            params_target = params_target.to(device)
+            logits = student(specs_batch)
+            loss = huber_loss(logits, params_target, delta=0.5).mean()
+            if torch.isfinite(loss):
+                total_loss += loss.item()
+                n_batches += 1
+    return total_loss / max(1, n_batches)
+
+
+def _build_phase_a_optimizer(student, *, lr, weight_decay,
+                             mapper_lr_scale=1.0, struct_lr_scale=1.0,
+                             dyn_lr_scale=1.0):
+    """AdamW with optional differential LR groups (Friedman KNet recipe).
+
+    Single-group when all scales are 1.0 (safe for MLP / Plain students).
+    Group naming follows the same conventions used by the Friedman KNet
+    harness (input_mapper / output_mapper / post_readout_transfer /
+    z_logits / u_logits / raw_leak / raw_drive_g / cell_lib.* / vca_*).
+    """
+    mapper_params, struct_params, dyn_params = [], [], []
+    for name, p in student.named_parameters():
+        if not p.requires_grad:
+            continue
+        n = name.lower()
+        if any(tag in n for tag in ("input_mapper.", "output_mapper.",
+                                    "post_readout_transfer.")):
+            mapper_params.append(p)
+        elif any(tag in n for tag in ("z_logits", "u_logits", "raw_leak",
+                                      "raw_drive_g", "vca_")):
+            struct_params.append(p)
+        else:
+            dyn_params.append(p)
+    if mapper_lr_scale == 1.0 and struct_lr_scale == 1.0 and dyn_lr_scale == 1.0:
+        return torch.optim.AdamW(student.parameters(), lr=lr, weight_decay=weight_decay)
+    group_list = []
+    if mapper_params:
+        group_list.append({"params": mapper_params, "lr": lr * mapper_lr_scale,
+                           "weight_decay": weight_decay})
+    if struct_params:
+        group_list.append({"params": struct_params, "lr": lr * struct_lr_scale,
+                           "weight_decay": weight_decay})
+    if dyn_params:
+        group_list.append({"params": dyn_params, "lr": lr * dyn_lr_scale,
+                           "weight_decay": weight_decay})
+    if not group_list:
+        return torch.optim.AdamW(student.parameters(), lr=lr, weight_decay=weight_decay)
+    return torch.optim.AdamW(group_list, lr=lr, weight_decay=weight_decay)
 
 
 def eval_epoch(student, val_loader, criterion, device):

@@ -178,6 +178,19 @@ try:
     _bo_parser.add_argument('--teacher-dir', type=str, default=None)
     _bo_parser.add_argument('--seed', type=int, default=None)
     _bo_parser.add_argument('--input-preprocessing', choices=['knet', 'q75'], default=None)
+    # Canonical Phase-A flags (plan canonical-ctle-unify).  When --canonical-dataset
+    # is passed, the script bypasses DAgger and runs the static-data, Huber-only
+    # Phase-A training mode (no relabeling, no surrogate-through terms).
+    _bo_parser.add_argument('--canonical-dataset', type=str, default=None,
+                            help='Path to canonical Phase-A .npz (specs + flow labels).')
+    _bo_parser.add_argument('--prepare-canonical-dataset', type=str, default=None,
+                            help='Path to write the canonical Phase-A .npz and exit (no training).')
+    _bo_parser.add_argument('--phase-a-epochs', type=int, default=None,
+                            help='Phase-A training epochs (overrides --epochs-per-iter when in Phase A).')
+    _bo_parser.add_argument('--phase-a-boundary-ratio', type=float, default=0.5,
+                            help='Boundary ratio used when preparing the canonical dataset.')
+    _bo_parser.add_argument('--phase-a-n-samples', type=int, default=20000,
+                            help='Number of specs in the canonical dataset.')
     _bo_args, _ = _bo_parser.parse_known_args()
     if _bo_args.dagger_iterations is not None:
         DAGGER_ITERATIONS = _bo_args.dagger_iterations
@@ -2545,6 +2558,61 @@ scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
     optimizer, T_max=EPOCHS_PER_ITER, eta_min=LR_FLOOR
 )
 
+# ── Canonical Phase-A gate (plan canonical-ctle-unify) ─────────────────────
+# Placed BEFORE the initial-dataset build so Phase-A trials never pay for the
+# (expensive) DAgger teacher labelling.  Exits via sys.exit(0) in every
+# Phase-A path, so the DAgger body below only runs without Phase-A flags.
+if _bo_args.canonical_dataset is not None or _bo_args.prepare_canonical_dataset is not None:
+    from ctle_dagger_common import (create_canonical_flow_dataset,
+                                     load_canonical_flow_dataset, run_phase_a_training)
+    if _bo_args.prepare_canonical_dataset is not None:
+        target_path = Path(_bo_args.prepare_canonical_dataset)
+        if target_path.exists() and not _bo_args.canonical_dataset:
+            _logger.info(f"[phaseA] canonical dataset already exists at {target_path}; loading")
+            canonical = load_canonical_flow_dataset(target_path)
+        else:
+            teacher_labeler = FlowTeacherLabeler(TEACHER_DIR, DEVICE)
+            canonical = create_canonical_flow_dataset(
+                df, teacher_labeler=teacher_labeler,
+                n_samples=int(_bo_args.phase_a_n_samples),
+                boundary_ratio=float(_bo_args.phase_a_boundary_ratio),
+                seed=int(_bo_args.seed if _bo_args.seed is not None else 100),
+                output_path=target_path,
+            )
+        if not _bo_args.canonical_dataset:
+            _logger.info("[phaseA] --prepare-canonical-dataset set: exiting before training")
+            sys.exit(0)
+    if _bo_args.canonical_dataset is not None:
+        canonical = load_canonical_flow_dataset(_bo_args.canonical_dataset)
+        phase_a_epochs = int(_bo_args.phase_a_epochs if _bo_args.phase_a_epochs is not None
+                              else _bo_args.epochs_per_iter if _bo_args.epochs_per_iter is not None
+                              else EPOCHS_PER_ITER)
+        ctx_phase_a = {
+            "DEVICE": DEVICE, "scaler_X": scaler_X, "scaler_y_p": scaler_y_p,
+            "zig_model": zig_model,
+            "eye_scale_h": eye_scale_h, "eye_scale_w": eye_scale_w, "eye_scale_j": eye_scale_j,
+            "canonical_dataset": canonical,
+            "epochs": phase_a_epochs,
+            "batch_size": int(_bo_args.batch_size if _bo_args.batch_size is not None else BATCH_SIZE),
+            "lr": float(_bo_args.lr if _bo_args.lr is not None else LR_INITIAL),
+            "weight_decay": float(_bo_args.weight_decay if _bo_args.weight_decay is not None else WEIGHT_DECAY),
+            "output_dir": OUTPUT_DIR,
+            "grad_clip": 1.0,
+            "val_eval_every": int(_bo_args.earlystop_eval_every if _bo_args.earlystop_eval_every is not None
+                                   else EARLYSTOP_EVAL_EVERY),
+            "earlystop_patience": int(EARLYSTOP_PATIENCE_EPOCHS),
+            "error_threshold": ERROR_THRESHOLD,
+            "input_preprocessing": _bo_args.input_preprocessing or "q75",
+            "input_log_min": getattr(student, "input_log_min", None) if hasattr(student, "input_log_min") else None,
+            "input_log_max": getattr(student, "input_log_max", None) if hasattr(student, "input_log_max") else None,
+        }
+        _logger.info(f"[phaseA] canonical-dataset gate engaged: {len(canonical['specs'])} specs, "
+                     f"epochs={phase_a_epochs}, batch={ctx_phase_a['batch_size']}, "
+                     f"lr={ctx_phase_a['lr']:.2e}")
+        run_phase_a_training(student, ctx_phase_a, model_name="phase_a_moe")
+        _logger.info("[phaseA] canonical-dataset gate: training complete; exiting before DAgger body")
+        sys.exit(0)
+
 # ── Initial dataset ──────────────────────────────────────────────────
 with Timer("build initial flow distillation dataset"):
     initial_data = create_flow_distillation_dataset(
@@ -2569,6 +2637,7 @@ log_label_quality_summary("Initial dataset labels", all_specs, all_params, zig_m
 # Carve out 10% validation split (never augmented by DAgger)
 train_subset, val_subset = distillation_dataset.split_train_val(val_frac=0.1)
 train_loader = distillation_dataset.get_loader(batch_size=BATCH_SIZE, shuffle=True, hard_weight=10.0)
+
 val_loader = distillation_dataset.get_val_loader(batch_size=BATCH_SIZE)
 _logger.info(f"Train: {len(train_subset)}, Val: {len(val_subset)}")
 
