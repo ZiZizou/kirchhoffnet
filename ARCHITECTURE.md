@@ -504,6 +504,36 @@ These can be invoked post-training via the `--run-deq-diagnostics` CLI flag in `
                           └──────────────────────────────────────────┘
 ```
 
+Readout families (selected by ``--readout``):
+
+- ``linear`` (pre-refactor default): linear OutputMapper reads projection
+  (or hidden) nodes; no accumulator tail, no OutputAffine.
+- ``temporal`` (default for new runs): ``h*d_out`` OTA mesh
+  (one FreeTanh per (hidden, accumulator) pair) + ``OutputAffine`` over
+  the accumulator tail.
+- ``shared``: one FreeTanh sense per hidden node vs a private learnable
+  ``Vref`` rail + a plain dense ``W[d_out x h]`` crossbar. The crossbar
+  has no gates and no VCA on the taps; VCA gates the senses only.
+- ``shared-x2``: two senses per node (``s=2``) with a +0.5 ``gm`` jitter on
+  every odd-indexed sense so each node has one default-init and one
+  shifted-init sense + ``W[d_out x 2h]``.
+
+CTLE Phase-A selection (BO loop): the same flag drives
+`kn_bayes_opt.py --readout` (study-level, never sampled by Optuna) and
+threads through to the dagger harness as `--kn-readout`; the seed trial
+(``START_POINTS["ctle"]``) always runs ``temporal`` as a reference anchor.
+Implementation: `docs/ctle-phase-a-readout-wiring-plan.md`.
+
+Shared-sense per-stage dynamics:
+
+```
+I_sense_k = Isat_k * tanh(gm_k * (A_k * x_j - B_k * Vref + theta_k))
+           × σ(readout_sense_z_logits)
+           × (VCA gate, optional)
+a_dot_i  = Σ_k W[i,k] * I_sense_k - leak_i * a_i - clip(a_i)
+Vref     = sigmoid(raw_vref_sense) * x_max   (per-stage scalar)
+```
+
 ### Inside one DifferentialStage
 
 ```

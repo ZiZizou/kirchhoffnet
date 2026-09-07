@@ -65,11 +65,19 @@ def format_parameter_breakdown(breakdown: dict) -> str:
     for stage_key in sorted(per_stage.keys()):
         lines.append(f"  {stage_key}:")
         bucket = per_stage[stage_key]
-        for sub_name in ("cell_lib", "z_logits", "u_logits", "raw_leak", "raw_drive_g", "boundary_cell_lib", "boundary_z_logits", "raw_vref", "ref_z_logits", "ref_cell_lib", "output_ode_cell_lib", "output_ode_z_logits", "vca_W", "vca_v", "other"):
+        for sub_name in (
+            "cell_lib", "z_logits", "u_logits", "raw_leak", "raw_drive_g",
+            "boundary_cell_lib", "boundary_z_logits",
+            "raw_vref", "ref_z_logits", "ref_cell_lib",
+            "output_ode_cell_lib", "output_ode_z_logits",
+            "readout_sense_z_logits", "readout_sense_cell_lib",
+            "readout_crossbar", "raw_vref_sense",
+            "vca_W", "vca_v", "other",
+        ):
             if bucket.get(sub_name, 0):
                 lines.append(f"    {sub_name:<{stage_label_w}}: {bucket[sub_name]:>{width - stage_label_w - 6}}")
-        stage_total = sum(bucket.values())
-        lines.append(f"    {'── stage total:':<{stage_label_w + 2}} {stage_total}")
+            stage_total = sum(bucket.values())
+            lines.append(f"    {'── stage total:':<{stage_label_w + 2}} {stage_total}")
     lines.append("  " + "─" * (width - 2))
     lines.append(f"  {'total:':<{label_w + 2}} {total}")
     return "\n".join(lines)
@@ -596,6 +604,10 @@ class KirchhoffNetWithIO(nn.Module):
                     "ref_cell_lib": 0,
                     "output_ode_z_logits": 0,
                     "output_ode_cell_lib": 0,
+                    "readout_sense_z_logits": 0,
+                    "readout_sense_cell_lib": 0,
+                    "readout_crossbar": 0,
+                    "raw_vref_sense": 0,
                     "vca_W": 0,
                     "vca_v": 0,
                     "other": 0,
@@ -625,6 +637,14 @@ class KirchhoffNetWithIO(nn.Module):
                     stage_bucket["output_ode_z_logits"] += n; matched = True
                 elif tail.startswith("output_ode_cell_lib."):
                     stage_bucket["output_ode_cell_lib"] += n; matched = True
+                elif tail == "readout_sense_z_logits":
+                    stage_bucket["readout_sense_z_logits"] += n; matched = True
+                elif tail.startswith("readout_sense_cell_lib."):
+                    stage_bucket["readout_sense_cell_lib"] += n; matched = True
+                elif tail == "readout_crossbar_W":
+                    stage_bucket["readout_crossbar"] += n; matched = True
+                elif tail == "raw_vref_sense":
+                    stage_bucket["raw_vref_sense"] += n; matched = True
                 elif tail == "vca_W" or tail == "vca_W_core":
                     stage_bucket["vca_W"] += n; matched = True
                 elif tail.startswith("vca_v_"):

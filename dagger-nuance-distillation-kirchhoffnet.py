@@ -621,6 +621,11 @@ KN_LEAK_MODE        = "non-programmable"  # fixed leak_constant (config default 
 KN_INTERSTAGE_ACTIVATION = "residual-relu-tanh"  # interstage StageTransfer activation
 KN_FREEZE_READ          = True      # precompute edge currents once from state (frozen OTA read core)
 KN_TEMPORAL_READOUT     = True      # append per-stage output ODE accumulators (temporal-readout readout)
+KN_READOUT          = "temporal"      # readout family for the KNet student
+                                       # ("temporal" | "shared" | "shared-x2"); the
+                                       # accumulator tail (KN_TEMPORAL_READOUT) is
+                                       # always on — KN_READOUT only switches the
+                                       # edge family that charges the tail.
 KN_BOUNDARY_FAN_OUT = '{"0": [2, 4], "1": [1, 3], "2": [12, 5], "3": [7, 9]}'  # 4 inputs -> 8 boundary edges
 KN_INPUT_RAIL       = 4.0     # clamp normalized input to [-KN_INPUT_RAIL, KN_INPUT_RAIL] (x_max=4.0)
 
@@ -681,6 +686,13 @@ try:
     _bo_parser.add_argument('--kn-x-max', type=float, default=None)
     _bo_parser.add_argument('--kn-gm-max', type=float, default=None)
     _bo_parser.add_argument('--kn-isat-max', type=float, default=None)
+    _bo_parser.add_argument('--kn-readout', choices=['temporal', 'shared', 'shared-x2'],
+                            default='temporal',
+                            help="Readout family for the KNet student (default: temporal). "
+                                 "'shared' = one FreeTanh sense OTA per hidden node vs a "
+                                 "private learnable Vref rail + dense crossbar W[7 x h]. "
+                                 "'shared-x2' = two senses per node (different gm operating "
+                                 "points) + W[7 x 2h]. Fixed per study; BO never samples it.")
     _bo_parser.add_argument('--t-span', type=float, default=None)
     _bo_parser.add_argument('--boundary-fan-out', type=str, default=None)
     _bo_parser.add_argument('--lr', type=float, default=None)
@@ -838,6 +850,21 @@ try:
         KN_ISAT_MAX = float(_bo_args.kn_isat_max)
 except Exception as _e:
     _logger.warning(f"[BO] override parsing failed: {_e}")
+
+
+# --kn-readout override (CTLE Phase-A wired-readout plan §2.1).
+# IMPORTANT: validated OUTSIDE the BO-override try/except above so a typo
+# fails fast instead of being silently demoted to the default. argparse
+# ``choices=`` already constrains the value to the three valid strings,
+# so this block is just a defensive re-assertion for non-argparse callers
+# (e.g. unit tests that build _bo_args programmatically).
+if getattr(_bo_args, "kn_readout", None) is not None:
+    if _bo_args.kn_readout not in ("temporal", "shared", "shared-x2"):
+        raise ValueError(
+            f"--kn-readout must be 'temporal', 'shared', or 'shared-x2', "
+            f"got {_bo_args.kn_readout!r}"
+        )
+    KN_READOUT = str(_bo_args.kn_readout)
 
 
 # =============================================================================
@@ -1660,7 +1687,8 @@ class LocalKirchhoffStudentWrapper(nn.Module):
                  vca_separate_core_bus: bool = False,
                  vca_bias: bool = False,
                  gm_max: float | None = None,
-                 isat_max: float | None = None):
+                 isat_max: float | None = None,
+                 kn_readout: str = "temporal"):
         super().__init__()
 
         if param_log_bounds is None:
@@ -1712,6 +1740,17 @@ class LocalKirchhoffStudentWrapper(nn.Module):
         # train_script.py and kn_bayes_opt.py conventions.
         self.gm_max = float(gm_max) if gm_max is not None else None
         self.isat_max = float(isat_max) if isat_max is not None else None
+        # Readout family (CTLE Phase-A wired-readout plan §2.2): 'temporal'
+        # = legacy h*7 OTA mesh; 'shared' = 1 sense/hidden + dense crossbar
+        # W[7 x h]; 'shared-x2' = 2 senses/hidden (per-node gm jitter) +
+        # W[7 x 2h]. The accumulator tail + OutputAffine read are unchanged
+        # in all three modes (enable_temporal_readout stays True).
+        if kn_readout not in ("temporal", "shared", "shared-x2"):
+            raise ValueError(
+                f"KirchhoffNetStudent.kn_readout must be 'temporal', 'shared', "
+                f"or 'shared-x2', got {kn_readout!r}"
+            )
+        self.kn_readout = str(kn_readout)
 
 
         self.register_buffer("input_log_min", torch.as_tensor(input_log_min, dtype=torch.float32))
@@ -1761,6 +1800,16 @@ class LocalKirchhoffStudentWrapper(nn.Module):
         cell_lib_template = make_cell_library(
             cell_library, gm_max=self.gm_max, isat_max=self.isat_max,
         )
+        # Map kn_readout ('temporal' | 'shared' | 'shared-x2') onto the
+        # builder kwargs introduced by the shared-sense-crossbar plan. The
+        # accumulator tail (``enable_temporal_readout=True``) is shared
+        # by all three modes; only the edge family that charges it changes.
+        _kn_readout_to_mode = {
+            "temporal": ("ota_mesh", 1),
+            "shared": ("shared_sense", 1),
+            "shared-x2": ("shared_sense", 2),
+        }
+        readout_mode, readout_senses = _kn_readout_to_mode[self.kn_readout]
         self.net = build_net_from_config(
             cfg,
             cell_lib=cell_lib_template,
@@ -1769,6 +1818,8 @@ class LocalKirchhoffStudentWrapper(nn.Module):
             interstage_activation=interstage_activation,
             boundary_fan_out=self.boundary_fan_out,
             enable_temporal_readout=enable_temporal_readout,
+            readout_mode=readout_mode,
+            readout_senses_per_node=int(readout_senses),
 
             x_max=self.x_max,
             vca_enabled=self.vca_enabled,
@@ -1849,6 +1900,7 @@ class LocalKirchhoffStudentWrapper(nn.Module):
                 f"freeze_read={self.freeze_read}, "
                 f"interstage_activation={self.interstage_activation}, "
                 f"temporal_readout={self.enable_temporal_readout}, "
+                f"kn_readout={self.kn_readout}, "
                 f"vca_enabled={self.vca_enabled}, vca_rank={self.vca_rank}, "
                 f"vca_core={self.vca_core_enabled}, "
                 f"vca_gate_shunt={self.vca_gate_shunt}, "
@@ -2979,6 +3031,7 @@ student = LocalKirchhoffStudentWrapper(
     vca_bias=KN_VCA_BIAS,
     gm_max=KN_GM_MAX,
     isat_max=KN_ISAT_MAX,
+    kn_readout=KN_READOUT,
 ).to(DEVICE)
 
 _logger.info(
@@ -2988,6 +3041,11 @@ _logger.info(
     f"separate_core_bus={KN_VCA_SEPARATE_CORE_BUS} "
     f"(mirrors train_script.py --vca/--vca-core/--vca-gate-shunt/"
     f"--vca-separate-core-bus)"
+)
+_logger.info(
+    f"Student readout family: kn_readout={KN_READOUT} "
+    f"(tail={'on' if KN_TEMPORAL_READOUT else 'off'}; mirrors "
+    f"train_script.py --readout)"
 )
 
 # No `student.prepare(...)` step needed — local KirchhoffNetWithIO

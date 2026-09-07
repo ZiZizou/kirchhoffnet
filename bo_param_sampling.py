@@ -217,7 +217,8 @@ def _knet_param_count_cached(num_hidden: int, num_stages: int,
                              in_dim: int, out_dim: int,
                              fanout_count: int, use_robust_input: bool,
                              moe_num_experts: int, moe_gate_rank: int,
-                             dagger: bool) -> int:
+                             dagger: bool, readout_mode: str = "ota_mesh",
+                             readout_senses: int = 1) -> int:
     """Exact KNet trainable-param count by building the net (no training).
 
     The count depends on hidden, stages, k, rank AND fanout for the generic
@@ -230,6 +231,12 @@ def _knet_param_count_cached(num_hidden: int, num_stages: int,
     (fixed-distillation pattern); ``dagger=False`` reproduces the generic
     ``train_script.py`` construction. ``moe_num_experts``/``moe_gate_rank``
     are readout/gate dimensions on the CTLE dagger path only.
+
+    ``readout_mode``/``readout_senses`` mirror the shared-sense-crossbar
+    plan's builder kwargs: ``"ota_mesh"`` + 1 (legacy h*d_out mesh),
+    ``"shared_sense"`` + 1 (one sense per hidden node + dense crossbar), or
+    ``"shared_sense"`` + 2 (two senses per node). The accumulator tail is
+    always enabled (``enable_temporal_readout=True``) in every mode.
     """
     if str(ROOT) not in sys.path:
         sys.path.insert(0, str(ROOT))
@@ -277,6 +284,8 @@ def _knet_param_count_cached(num_hidden: int, num_stages: int,
         interstage_activation="residual-relu-tanh",
         boundary_fan_out=fanout,
         enable_temporal_readout=True, x_max=4.0,
+        readout_mode=readout_mode,
+        readout_senses_per_node=int(readout_senses),
         vca_enabled=True, vca_rank=vca_rank, vca_core_enabled=True,
         vca_gate_shunt=False, vca_separate_core_bus=True, vca_bias=False,
     )
@@ -287,12 +296,14 @@ def knet_param_count(num_hidden: int, num_stages: int, small_world_k: int,
                      vca_rank: int, *, in_dim: int, out_dim: int,
                      fanout_count: int = 2, use_robust_input: bool = False,
                      moe_num_experts: int = 0, moe_gate_rank: int = 0,
-                     dagger: bool = False) -> int:
+                     dagger: bool = False, readout_mode: str = "ota_mesh",
+                     readout_senses: int = 1) -> int:
     """Public wrapper around the cached build-based KNet count."""
     return _knet_param_count_cached(
         int(num_hidden), int(num_stages), int(small_world_k), int(vca_rank),
         int(in_dim), int(out_dim), int(fanout_count), bool(use_robust_input),
         int(moe_num_experts), int(moe_gate_rank), bool(dagger),
+        readout_mode, int(readout_senses),
     )
 
 
@@ -307,6 +318,8 @@ def knet_feasible_arches(*, soft_limit: int, in_dim: int, out_dim: int,
                          fanout_choices: tuple[int, ...] = (2,),
                          use_robust_input: bool = False,
                          dagger: bool = False,
+                         readout_mode: str = "ota_mesh",
+                         readout_senses: int = 1,
                          moe_experts_choices: tuple[int, ...] = (),
                          moe_gate_rank_choices: tuple[int, ...] = (),
                          require_moe: bool = False) -> list[tuple]:
@@ -318,10 +331,14 @@ def knet_feasible_arches(*, soft_limit: int, in_dim: int, out_dim: int,
     ``hidden >= in_dim * fanout_count`` is enforced (boundary fan-out needs
     enough distinct targets). Cached per window so the build cost is paid
     once per study.
+
+    ``readout_mode`` / ``readout_senses`` are fixed per-study constants
+    (not sampled dims), forwarded into every ``knet_param_count`` call.
     """
     key = (soft_limit, in_dim, out_dim, hidden_range, stages_range,
            k_choices, rank_range, fanout_choices, use_robust_input,
-           dagger, moe_experts_choices, moe_gate_rank_choices, require_moe)
+           dagger, readout_mode, int(readout_senses),
+           moe_experts_choices, moe_gate_rank_choices, require_moe)
     if key in _knet_feasible_cache:
         return _knet_feasible_cache[key]
 
@@ -351,7 +368,9 @@ def knet_feasible_arches(*, soft_limit: int, in_dim: int, out_dim: int,
                                             use_robust_input=use_robust_input,
                                             moe_num_experts=experts,
                                             moe_gate_rank=gate_rank,
-                                            dagger=True)
+                                            dagger=True,
+                                            readout_mode=readout_mode,
+                                            readout_senses=readout_senses)
                                     except Exception:
                                         continue
                                     if p <= soft_limit:
@@ -367,7 +386,9 @@ def knet_feasible_arches(*, soft_limit: int, in_dim: int, out_dim: int,
                                     in_dim=in_dim, out_dim=out_dim,
                                     fanout_count=fanout,
                                     use_robust_input=use_robust_input,
-                                    dagger=False)
+                                    dagger=False,
+                                    readout_mode=readout_mode,
+                                    readout_senses=readout_senses)
                             except Exception:
                                 continue
                             if p <= soft_limit:

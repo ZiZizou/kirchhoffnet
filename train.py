@@ -157,9 +157,10 @@ def _stage_sparsity_loss(stage, traj: torch.Tensor) -> torch.Tensor:
 
     L1 weight-sparsity penalty on the tanh_free device parameters. For each
     stage, walks ``cell_lib``, ``boundary_cell_lib``, ``output_ode_cell_lib``,
-    and ``ref_cell_lib`` (when each is a ``FreeTanhLibrary``) and averages
-    ``|p|`` over the non-sign parameters (``s_raw`` is a discrete ±1 with STE
-    and is excluded). Returns zero for stages with no FreeTanh library.
+    ``ref_cell_lib``, and ``readout_sense_cell_lib`` (when each is a
+    ``FreeTanhLibrary``) and averages ``|p|`` over the non-sign parameters
+    (``s_raw`` is a discrete ±1 with STE and is excluded). Returns zero for
+    stages with no FreeTanh library.
 
     Complements ``edge_gate`` (active-edge *count*) by applying magnitude
     pressure to the device weights themselves. ``reg_scale`` from the caller
@@ -172,6 +173,10 @@ def _stage_sparsity_loss(stage, traj: torch.Tensor) -> torch.Tensor:
         getattr(stage, "boundary_cell_lib", None),
         getattr(stage, "output_ode_cell_lib", None),
         getattr(stage, "ref_cell_lib", None),
+        # B2: shared-sense readout family gets the same magnitude pressure as
+        # the legacy mesh so the optimizer can prune senses alongside
+        # boundary / ref / mesh devices.
+        getattr(stage, "readout_sense_cell_lib", None),
     ):
         if lib is None or not isinstance(lib, FreeTanhLibrary):
             continue
@@ -210,6 +215,10 @@ def _stage_entropy_loss(stage, traj: torch.Tensor) -> torch.Tensor:
         gates.append(torch.sigmoid(stage.boundary_z_logits))
     if getattr(stage, "output_ode_z_logits", None) is not None:
         gates.append(torch.sigmoid(stage.output_ode_z_logits))
+    # F3 parity: shared-sense gates must also receive crisp-selection
+    # entropy pressure so they commit alongside the other edge families.
+    if getattr(stage, "readout_sense_z_logits", None) is not None:
+        gates.append(torch.sigmoid(stage.readout_sense_z_logits))
     if not gates:
         return seed
     eps = 1e-6
@@ -230,10 +239,15 @@ def _device_l2_penalty(net) -> torch.Tensor:
 
       - ``FreeTanhLibrary`` cell params: ``a_raw``, ``b_raw``, ``gm_raw``,
         ``isat_raw``, ``theta_raw``, ``g_resistive_raw`` on ``cell_lib``,
-        ``boundary_cell_lib``, ``output_ode_cell_lib``, and ``ref_cell_lib``
-        (when each exists and is a ``FreeTanhLibrary``). ``s_raw`` is skipped
-        because it is a discrete ±1 sign with STE; penalizing it would push
-        ``sign(0) = 0`` and kill edges.
+        ``boundary_cell_lib``, ``output_ode_cell_lib``, ``ref_cell_lib``,
+        and ``readout_sense_cell_lib`` (when each exists and is a
+        ``FreeTanhLibrary``). ``s_raw`` is skipped because it is a discrete
+        ±1 sign with STE; penalizing it would push ``sign(0) = 0`` and kill
+        edges.
+      - Shared-sense readout scalars + dense crossbar: ``readout_sense_z_logits``
+        and ``raw_vref_sense`` (treated as plain L2 targets, same as the
+        OutputAffine / VCA group below). The dense ``readout_crossbar_W`` is
+        included as a plain L2 target for the same reason.
       - VCA params: ``vca_W``, ``vca_W_core``, ``vca_v_boundary``,
         ``vca_v_readout``, ``vca_v_core``.
       - Interstage residual transfer: ``StageTransfer.residual_w1/w2/w3/vth``
@@ -276,12 +290,18 @@ def _device_l2_penalty(net) -> torch.Tensor:
             getattr(stage, "boundary_cell_lib", None),
             getattr(stage, "output_ode_cell_lib", None),
             getattr(stage, "ref_cell_lib", None),
+            getattr(stage, "readout_sense_cell_lib", None),
         ):
             if isinstance(lib, FreeTanhLibrary):
                 for name, p in lib.named_parameters():
                     if name == "s_raw":
                         continue
                     _accum(p)
+        # Shared-sense readout scalars + the dense crossbar (plain L2
+        # targets, like the OutputAffine / VCA params below).
+        _accum(getattr(stage, "readout_sense_z_logits", None))
+        _accum(getattr(stage, "raw_vref_sense", None))
+        _accum(getattr(stage, "readout_crossbar_W", None))
         for vca_name in (
             "vca_W",
             "vca_W_core",
@@ -347,6 +367,14 @@ def _compute_regularizers(
         if getattr(stage, "output_ode_z_logits", None) is not None:
             loss_edge_gate = loss_edge_gate + torch.sigmoid(
                 stage.output_ode_z_logits
+            ).sum()
+        # Include shared-sense edge gates (F3 parity with the legacy mesh):
+        # the sense bank has its own per-sense z_logits that must receive the
+        # same L1 pressure so the optimizer can prune senses alongside the
+        # boundary / mesh families.
+        if getattr(stage, "readout_sense_z_logits", None) is not None:
+            loss_edge_gate = loss_edge_gate + torch.sigmoid(
+                stage.readout_sense_z_logits
             ).sum()
         loss_rail = loss_rail + _stage_rail_loss(stage, traj)
         loss_tanh_sat = loss_tanh_sat + _stage_tanh_sat_loss(stage, traj)

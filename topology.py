@@ -785,6 +785,15 @@ def prune_stage(
     """
     from differential_stage import DifferentialStage
 
+    # Shared-sense + crossbar readout is not yet supported by the pruner
+    # (it has no notion of the sense bank or the dense crossbar).
+    if getattr(stage, "_has_shared_readout", False):
+        raise ValueError(
+            "prune_stage: shared_sense readout not yet supported (the "
+            "pruner cannot rebuild the sense bank + crossbar); use "
+            "readout_mode='ota_mesh' for pruning runs."
+        )
+
     z = stage.edge_gates().detach().cpu()
     # When budget was enabled during training, combine sigmoid * budget gate
     # as the effective edge mask. Budget-losers with still-positive sigmoid
@@ -1318,6 +1327,11 @@ def topology_to_stage(
     output_ode_src: list[int] | None = None,
     output_ode_dst: list[int] | None = None,
     output_ode_cell_lib: SimpleEdgeLibrary | RealisticTanhLibrary | RealisticTanhUpgradeLibrary | FreeTanhLibrary | AntiParallelFreeTanhLibrary | None = None,
+    readout_mode: str = "ota_mesh",
+    readout_senses_per_node: int = 1,
+    readout_sense_src: list[int] | None = None,
+    readout_sense_cell_lib: SimpleEdgeLibrary | RealisticTanhLibrary | RealisticTanhUpgradeLibrary | FreeTanhLibrary | AntiParallelFreeTanhLibrary | None = None,
+    readout_crossbar_shape: tuple[int, int] | None = None,
     output_ode_node_count: int = 0,
     vca_enabled: bool = False,
     vca_rank: int = 2,
@@ -1381,6 +1395,21 @@ def topology_to_stage(
             cell type of ``cell_lib`` and be sized for ``len(output_ode_src)``
             edges. Required when ``output_ode_src``/``output_ode_dst`` are
             provided.
+        readout_mode: ``"ota_mesh"`` (default) builds the legacy h*d_out
+            temporal-readout OTA mesh. ``"shared_sense"`` builds one sense
+            OTA per hidden node (optionally two at different operating
+            points) + a dense crossbar readout instead; mutually exclusive
+            with ``output_ode_src``/``output_ode_dst``. Forwarded to
+            ``DifferentialStage``.
+        readout_senses_per_node: ``1`` or ``2`` senses per hidden node in
+            shared mode (``2`` adds an init jitter to the second copy's gm so
+            the operating points differ).
+        readout_sense_src: List of compact source node indices, one per
+            sense cell (``s*h`` entries). Forwarded to ``DifferentialStage``.
+        readout_sense_cell_lib: Template cell library sized for the sense
+            bank; cloned per stage so each stage owns its OTA parameters.
+        readout_crossbar_shape: ``(d_out, s*h)`` crossbar shape; forwarded to
+            ``DifferentialStage``.
         output_ode_node_count: Number of output ODE accumulator nodes appended
             to this stage's state. When ``> 0``, ``num_nodes`` passed to
             ``DifferentialStage`` is ``len(active_nodes) + output_ode_node_count``
@@ -1489,6 +1518,66 @@ def topology_to_stage(
                 use_isat_normalization=cell_lib._use_isat_normalization,
             )
 
+    # Shared-sense readout: clone the template sense cell library per stage
+    # (mirrors the output_ode clone below) so each stage owns its own sense
+    # OTA parameters. The sense src layout in ``build_net_from_config`` is
+    # **interleaved** (one node's s senses sit adjacent in the buffer), so
+    # ``readout_sense_cell_lib.gm_raw`` is arranged as
+    # ``[sense0_node0, sense1_node0, sense0_node1, sense1_node1, ...]`` for
+    # ``s=2``. With ``readout_senses_per_node == 2`` we add a +0.5 init
+    # jitter to the k=1 sense of every node (``gm_raw[1::2]``) so the two
+    # senses on the same node start at different saturation points; the k=0
+    # sense of every node stays at the default ``-5.0`` low-current init.
+    n_sense_clone = len(readout_sense_src) if readout_sense_src else 0
+    if readout_sense_cell_lib is not None and n_sense_clone > 0:
+        if isinstance(readout_sense_cell_lib, SimpleEdgeLibrary):
+            readout_sense_cell_lib = SimpleEdgeLibrary(
+                num_edges=n_sense_clone, mode=readout_sense_cell_lib._mode,
+            )
+        elif isinstance(readout_sense_cell_lib, RealisticTanhLibrary):
+            readout_sense_cell_lib = RealisticTanhLibrary(
+                num_edges=n_sense_clone,
+                bias_enabled=readout_sense_cell_lib._bias_enabled,
+            )
+        elif isinstance(readout_sense_cell_lib, RealisticTanhUpgradeLibrary):
+            readout_sense_cell_lib = RealisticTanhUpgradeLibrary(
+                num_edges=n_sense_clone,
+                gm_min=readout_sense_cell_lib.gm_min,
+                gm_max=readout_sense_cell_lib.gm_max,
+                isat_min=readout_sense_cell_lib.isat_min,
+                isat_max=readout_sense_cell_lib.isat_max,
+                bias_enabled=readout_sense_cell_lib._bias_enabled,
+            )
+        elif isinstance(readout_sense_cell_lib, FreeTanhLibrary):
+            readout_sense_cell_lib = FreeTanhLibrary(
+                num_edges=n_sense_clone,
+                gm_min=readout_sense_cell_lib.gm_min,
+                gm_max=readout_sense_cell_lib.gm_max,
+                isat_min=readout_sense_cell_lib.isat_min,
+                isat_max=readout_sense_cell_lib.isat_max,
+                bias_enabled=readout_sense_cell_lib._bias_enabled,
+                parallel_tanh_mult_enabled=readout_sense_cell_lib._parallel_tanh_mult_enabled,
+            )
+            if int(readout_senses_per_node) == 2:
+                # Interleaved layout: odd-indexed cells are sense k=1 of
+                # each hidden node. Jitter only those so every node
+                # contributes one default-init and one shifted-init sense.
+                with torch.no_grad():
+                    readout_sense_cell_lib.gm_raw.data[1::2] += 0.5
+        elif isinstance(readout_sense_cell_lib, AntiParallelFreeTanhLibrary):
+            readout_sense_cell_lib = AntiParallelFreeTanhLibrary(
+                num_edges=n_sense_clone,
+                kappa_min=readout_sense_cell_lib.kappa_min,
+                kappa_max=readout_sense_cell_lib.kappa_max,
+                gm_min=readout_sense_cell_lib.gm_min,
+                gm_max=readout_sense_cell_lib.gm_max,
+                isat_min=readout_sense_cell_lib.isat_min,
+                isat_max=readout_sense_cell_lib.isat_max,
+                theta_max=readout_sense_cell_lib.theta_max,
+                theta_enabled=readout_sense_cell_lib._theta_enabled,
+                use_isat_normalization=readout_sense_cell_lib._use_isat_normalization,
+            )
+
     # Clone the temporal-readout cell library per stage so each stage owns
     # its own OTA parameter set for the readout edges. Without this clone,
     # the same library object would be registered as a submodule on every
@@ -1564,6 +1653,11 @@ def topology_to_stage(
         output_ode_src=output_ode_src,
         output_ode_dst=output_ode_dst,
         output_ode_cell_lib=output_ode_cell_lib,
+        readout_mode=readout_mode,
+        readout_senses_per_node=readout_senses_per_node,
+        readout_sense_src=readout_sense_src,
+        readout_sense_cell_lib=readout_sense_cell_lib,
+        readout_crossbar_shape=readout_crossbar_shape,
         vca_enabled=vca_enabled,
         vca_rank=vca_rank,
         vca_in_dim=vca_in_dim,
@@ -1603,6 +1697,8 @@ def build_net_from_preset(
     boundary_fan_out: dict[int, list[int]] | None = None,
     enable_ref_edges: bool = False,
     enable_temporal_readout: bool = False,
+    readout_mode: str = "ota_mesh",
+    readout_senses_per_node: int = 1,
     vca_enabled: bool = False,
     vca_rank: int | None = None,
     vca_core_enabled: bool = False,
@@ -1614,6 +1710,17 @@ def build_net_from_preset(
     core_refresh_interval: int = 0,
 ):
     """Build a full KirchhoffNetWithIO from a config.PRESETS entry.
+
+    ``readout_mode`` / ``readout_senses_per_node`` select the readout
+    family (see ``build_net_from_config``): ``ota_mesh`` (default, legacy
+    h*d_out temporal OTA mesh), ``shared_sense`` with 1 sense per hidden
+    node, or ``shared_sense`` with 2 senses per node (the two copies start
+    at different gm operating points so they explore distinct saturating
+    regimes). ``enable_temporal_readout`` must be ``True`` whenever the
+    readout tail (``out_dim`` output-ODE accumulator nodes appended to each
+    stage) is wanted — i.e. for all three CLI ``--readout`` choices
+    (temporal, shared, shared-x2) — while ``readout_mode`` switches only
+    the edge family (mesh vs sense bank).
 
     Resolution precedence: explicit value > preset value > hardcoded default.
 
@@ -1729,6 +1836,8 @@ def build_net_from_preset(
         boundary_fan_out=boundary_fan_out,
         enable_ref_edges=enable_ref_edges,
         enable_temporal_readout=enable_temporal_readout,
+        readout_mode=readout_mode,
+        readout_senses_per_node=readout_senses_per_node,
         vca_enabled=vca_enabled,
         vca_rank=vca_rank,
         vca_core_enabled=vca_core_enabled,
@@ -1758,6 +1867,8 @@ def build_net_from_config(
     boundary_fan_out: dict[int, list[int]] | None = None,
     enable_ref_edges: bool = False,
     enable_temporal_readout: bool = False,
+    readout_mode: str = "ota_mesh",
+    readout_senses_per_node: int = 1,
     vca_enabled: bool = False,
     vca_rank: int | None = None,
     vca_core_enabled: bool = False,
@@ -1769,6 +1880,24 @@ def build_net_from_config(
     core_refresh_interval: int = 0,
 ):
     """Build a KirchhoffNetWithIO from a full config dict.
+
+    ``readout_mode`` (``"ota_mesh"`` default | ``"shared_sense"``) selects
+    the readout edge family built when ``enable_temporal_readout=True``:
+
+      - ``"ota_mesh"``: legacy h*d_out temporal-readout OTA mesh — every
+        hidden node connects to every output ODE accumulator via its own
+        cell + ``output_ode_z_logits`` gate + VCA tap.
+      - ``"shared_sense"``: one sense OTA per hidden node (or two, see
+        ``readout_senses_per_node``) driven against a per-stage learnable
+        Vref rail, plus a plain dense crossbar ``W [d_out x s*h]`` mixing
+        the sense currents into the accumulator tail. The crossbar has no
+        gates and no VCA; ``vca_v_readout`` gates the sense currents only.
+        Requires every stage to have the same width (checked by
+        ``KirchhoffNetWithIO``).
+
+    ``readout_senses_per_node`` must be ``1`` or ``2``; ``2`` gives the two
+    senses of a node different gm operating points at init (second copy
+    jittered ``+0.5`` on ``gm_raw`` per stage).
 
     ``leak_mode`` and ``leak_constant`` can be specified either explicitly or
     via the ``cfg`` dict (``cfg['leak_mode']`` / ``cfg['leak_constant']``).
@@ -2003,18 +2132,92 @@ def build_net_from_config(
                 f"boundary edges: {type(cell_lib).__name__}"
             )
 
-    # Temporal-readout mode (temporal-readout plan): append ``out_dim``
-    # extra output ODE accumulator nodes to each stage's state, after
-    # the hidden and projection nodes. Hidden nodes connect all-to-all
-    # to each output ODE node via one-way OTA edges (source read-only,
-    # destination writable). At readout time the output ODE node
-    # voltages are scaled by a learnable ``OutputAffine`` layer,
-    # bypassing the linear ``OutputMapper`` projection.
+    # Readout mode validation (shared-sense-crossbar plan).
+    # ``readout_mode`` picks the readout edge family built when
+    # ``enable_temporal_readout=True``; ``readout_senses_per_node`` only
+    # matters for ``shared_sense``.
+    if readout_mode not in ("ota_mesh", "shared_sense"):
+        raise ValueError(
+            f"readout_mode must be 'ota_mesh' or 'shared_sense', got "
+            f"{readout_mode!r}"
+        )
+    if int(readout_senses_per_node) not in (1, 2):
+        raise ValueError(
+            f"readout_senses_per_node must be 1 or 2, got "
+            f"{readout_senses_per_node}"
+        )
+    enable_temporal_readout_effective = bool(enable_temporal_readout)
+    if readout_mode == "shared_sense" and not enable_temporal_readout_effective:
+        raise ValueError(
+            "build_net_from_config: readout_mode='shared_sense' requires "
+            "enable_temporal_readout=True (the sense crossbar writes into "
+            "the output-ODE accumulator tail)."
+        )
+    if readout_mode == "ota_mesh" and int(readout_senses_per_node) != 1:
+        # The legacy mesh has no concept of multi-sense per node; reject
+        # nonsensical combinations early instead of silently ignoring the
+        # senses count (F9).
+        raise ValueError(
+            "build_net_from_config: readout_mode='ota_mesh' requires "
+            "readout_senses_per_node=1; "
+            f"got {readout_senses_per_node!r}. Use --readout 'shared-x2' "
+            "for the 2-sense shared readout."
+        )
+
+    # Local helper: fresh cell library of the same concrete type/config as
+    # the core ``cell_lib``, sized ``n`` (identical to the boundary/
+    # output_ode clone ladders used elsewhere in this function).
+    def _readout_lib_clone(n: int):
+        if isinstance(cell_lib, SimpleEdgeLibrary):
+            return SimpleEdgeLibrary(num_edges=n, mode=cell_lib._mode)
+        if isinstance(cell_lib, RealisticTanhLibrary):
+            return RealisticTanhLibrary(
+                num_edges=n, bias_enabled=cell_lib._bias_enabled,
+            )
+        if isinstance(cell_lib, RealisticTanhUpgradeLibrary):
+            return RealisticTanhUpgradeLibrary(
+                num_edges=n,
+                gm_min=cell_lib.gm_min, gm_max=cell_lib.gm_max,
+                isat_min=cell_lib.isat_min, isat_max=cell_lib.isat_max,
+                bias_enabled=cell_lib._bias_enabled,
+            )
+        if isinstance(cell_lib, FreeTanhLibrary):
+            return FreeTanhLibrary(
+                num_edges=n,
+                gm_min=cell_lib.gm_min, gm_max=cell_lib.gm_max,
+                isat_min=cell_lib.isat_min, isat_max=cell_lib.isat_max,
+                bias_enabled=cell_lib._bias_enabled,
+                parallel_tanh_mult_enabled=cell_lib._parallel_tanh_mult_enabled,
+            )
+        if isinstance(cell_lib, AntiParallelFreeTanhLibrary):
+            return AntiParallelFreeTanhLibrary(
+                num_edges=n,
+                kappa_min=cell_lib.kappa_min, kappa_max=cell_lib.kappa_max,
+                gm_min=cell_lib.gm_min, gm_max=cell_lib.gm_max,
+                isat_min=cell_lib.isat_min, isat_max=cell_lib.isat_max,
+                theta_max=cell_lib.theta_max,
+                theta_enabled=cell_lib._theta_enabled,
+                use_isat_normalization=cell_lib._use_isat_normalization,
+            )
+        raise ValueError(
+            f"build_net_from_config: unsupported cell_lib type for "
+            f"readout edges: {type(cell_lib).__name__}"
+        )
+
+    # Readout tail mode: append ``out_dim`` extra output ODE accumulator
+    # nodes to each stage's state, after the hidden and projection nodes.
+    # At readout time the accumulator node voltages are scaled by a
+    # learnable ``OutputAffine`` layer, bypassing the linear ``OutputMapper``
+    # projection. The accumulator tail is common to both readout families
+    # (temporal mesh and shared sense); ``readout_mode`` selects the edge
+    # family that charges it.
     output_ode_src: list[int] | None = None
     output_ode_dst: list[int] | None = None
     output_ode_cell_lib = None
+    readout_sense_src: list[int] | None = None
+    readout_sense_cell_lib = None
+    readout_crossbar_shape: tuple[int, int] | None = None
     output_ode_count = 0
-    enable_temporal_readout_effective = bool(enable_temporal_readout)
     if enable_temporal_readout_effective:
         # Mutual exclusion with residual_tanh decoder: explicit digital
         # nonlinearity over the readout contradicts the analog-readout
@@ -2030,70 +2233,42 @@ def build_net_from_config(
                 "build_net_from_config: enable_temporal_readout=True is "
                 "incompatible with grouped_readout."
             )
-        # ``out_dim`` output ODE nodes. Each hidden node connects to each
-        # output ODE node via a one-way OTA edge. ``output_ode_dst`` uses
-        # compact coordinates [hid_count + proj_count, hid_count +
-        # proj_count + out_dim) so the edges reference the accumulator
-        # region at the tail of the ODE state vector.
         output_ode_count = int(out_dim)
-        proj_count_first = len(first_proj)
-        core_node_count_first = n_first_hid + proj_count_first
-        output_ode_src = []
-        output_ode_dst = []
-        for h_idx in range(n_first_hid):
-            for o_idx in range(output_ode_count):
-                output_ode_src.append(int(h_idx))
-                output_ode_dst.append(core_node_count_first + o_idx)
-        # Fresh cell library for the readout edges, sized for the
-        # boundary-edge count. Same type/config as the core cell_lib so
-        # readout OTAs behave identically to core edges.
-        n_out_ode_edges = len(output_ode_src)
-        if isinstance(cell_lib, SimpleEdgeLibrary):
-            output_ode_cell_lib = SimpleEdgeLibrary(
-                num_edges=n_out_ode_edges, mode=cell_lib._mode,
+        if readout_mode == "shared_sense":
+            s = int(readout_senses_per_node)
+            # One sense per hidden node (optionally s=2). Sense k of node h
+            # lives at flat index h*s + k, so ``readout_sense_src`` is the
+            # hidden node index repeated s times (the two senses of a node
+            # start at different operating points via a per-stage gm jitter
+            # applied in topology_to_stage).
+            readout_sense_src = [
+                int(h) for h in range(n_first_hid) for _ in range(s)
+            ]
+            readout_crossbar_shape = (
+                int(out_dim), s * n_first_hid,
             )
-        elif isinstance(cell_lib, RealisticTanhLibrary):
-            output_ode_cell_lib = RealisticTanhLibrary(
-                num_edges=n_out_ode_edges,
-                bias_enabled=cell_lib._bias_enabled,
-            )
-        elif isinstance(cell_lib, RealisticTanhUpgradeLibrary):
-            output_ode_cell_lib = RealisticTanhUpgradeLibrary(
-                num_edges=n_out_ode_edges,
-                gm_min=cell_lib.gm_min,
-                gm_max=cell_lib.gm_max,
-                isat_min=cell_lib.isat_min,
-                isat_max=cell_lib.isat_max,
-                bias_enabled=cell_lib._bias_enabled,
-            )
-        elif isinstance(cell_lib, FreeTanhLibrary):
-            output_ode_cell_lib = FreeTanhLibrary(
-                num_edges=n_out_ode_edges,
-                gm_min=cell_lib.gm_min,
-                gm_max=cell_lib.gm_max,
-                isat_min=cell_lib.isat_min,
-                isat_max=cell_lib.isat_max,
-                bias_enabled=cell_lib._bias_enabled,
-                parallel_tanh_mult_enabled=cell_lib._parallel_tanh_mult_enabled,
-            )
-        elif isinstance(cell_lib, AntiParallelFreeTanhLibrary):
-            output_ode_cell_lib = AntiParallelFreeTanhLibrary(
-                num_edges=n_out_ode_edges,
-                kappa_min=cell_lib.kappa_min,
-                kappa_max=cell_lib.kappa_max,
-                gm_min=cell_lib.gm_min,
-                gm_max=cell_lib.gm_max,
-                isat_min=cell_lib.isat_min,
-                isat_max=cell_lib.isat_max,
-                theta_max=cell_lib.theta_max,
-                theta_enabled=cell_lib._theta_enabled,
-                use_isat_normalization=cell_lib._use_isat_normalization,
+            readout_sense_cell_lib = _readout_lib_clone(
+                s * n_first_hid
             )
         else:
-            raise ValueError(
-                f"build_net_from_config: unsupported cell_lib type for "
-                f"temporal-readout edges: {type(cell_lib).__name__}"
-            )
+            # ota_mesh (legacy temporal readout): ``out_dim`` output ODE
+            # nodes. Each hidden node connects to each output ODE node via
+            # a one-way OTA edge. ``output_ode_dst`` uses compact
+            # coordinates [hid_count + proj_count, hid_count + proj_count +
+            # out_dim) so the edges reference the accumulator region at the
+            # tail of the ODE state vector.
+            proj_count_first = len(first_proj)
+            core_node_count_first = n_first_hid + proj_count_first
+            output_ode_src = []
+            output_ode_dst = []
+            for h_idx in range(n_first_hid):
+                for o_idx in range(output_ode_count):
+                    output_ode_src.append(int(h_idx))
+                    output_ode_dst.append(core_node_count_first + o_idx)
+            # Fresh cell library for the mesh readout edges. Same
+            # type/config as the core cell_lib so readout OTAs behave
+            # identically to core edges.
+            output_ode_cell_lib = _readout_lib_clone(len(output_ode_src))
 
     # Resolve write_idx and input mapper.
     fan_out_map = None
@@ -2189,6 +2364,11 @@ def build_net_from_config(
             output_ode_src=output_ode_src,
             output_ode_dst=output_ode_dst,
             output_ode_cell_lib=output_ode_cell_lib,
+            readout_mode=readout_mode,
+            readout_senses_per_node=int(readout_senses_per_node),
+            readout_sense_src=readout_sense_src,
+            readout_sense_cell_lib=readout_sense_cell_lib,
+            readout_crossbar_shape=readout_crossbar_shape,
             output_ode_node_count=output_ode_count,
             vca_enabled=vca_enabled_effective,
             vca_rank=vca_rank_effective,

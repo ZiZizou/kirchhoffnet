@@ -6,10 +6,18 @@ multiple optuna trials, while keeping a **fixed epoch budget** per trial
 (``--no-early-stop``) so the full fixed budget always runs.
 
 Permanently-on flags (every trial):
-    --freeze-read --temporal-readout --no-early-stop
+    --freeze-read --readout {temporal,shared,shared-x2} --no-early-stop
     --leak non-programmable --vca --vca-core --vca-separate-core-bus
     --cell-library tanh_free --hidden-family small_world
     --boundary-fan-out <json>
+
+The readout family is fixed per study via ``--readout {temporal,shared,
+shared-x2}`` (default ``temporal``); changing it between studies requires
+a fresh ``--output`` (the sampling fingerprint guards the resume).
+``--temporal-readout`` is a deprecated alias for ``--readout temporal``.
+A ``--readout linear`` option also exists in ``train_script.py`` for
+linear OutputMapper runs without an accumulator tail, but the BO loop
+never selects it.
 
 Search dimensions (15 dims per trial):
     Topology:    num_hidden, small_world_k, num_stages, fanout_count
@@ -446,6 +454,7 @@ def _build_command(
     device_l2_lambda: float,
     freeze_boundary: int,
     freeze_temporal_read: int,
+    readout: str = "temporal",
     output: Path,
     device: str,
     boundary_fan_out: dict | None = None,
@@ -471,7 +480,7 @@ def _build_command(
         "--boundary-fan-out", json.dumps(boundary_fan_out),
         "--cell-library", "tanh_free",
         "--leak", "non-programmable",
-        "--temporal-readout",
+        "--readout", readout,
         "--freeze-read",
         "--vca",
         "--vca-core",
@@ -699,6 +708,17 @@ def main() -> None:
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument("--dataset", required=True, choices=sorted(DATASETS))
+    parser.add_argument("--readout", choices=["temporal", "shared", "shared-x2"],
+                        default="temporal",
+                        help="Readout family for every trial (default: temporal). "
+                             "'shared' / 'shared-x2' use the shared-sense + "
+                             "dense-crossbar readout (1 / 2 senses per hidden "
+                             "node). Fixed per study; changing it requires a "
+                             "fresh --output (fingerprint-guarded).")
+    parser.add_argument("--no-seed-trial", action="store_true",
+                        help="Skip enqueueing the START_POINTS seed trial "
+                        "(trial 0 explores the search space from a "
+                        "random TPE sample instead).")
     parser.add_argument("--epochs", type=int, default=800,
                         help="Fixed epoch budget per trial (default: 800).")
     parser.add_argument("--n-trials", type=int, default=30)
@@ -813,10 +833,6 @@ def main() -> None:
     parser.add_argument("--resume", action="store_true",
                         help="Accepted for backwards compatibility. Existing "
                              "studies are resumed automatically.")
-    parser.add_argument("--no-seed-trial", action="store_true",
-                        help="Skip enqueueing the START_POINTS seed trial "
-                        "(trial 0 explores the search space from a "
-                        "random TPE sample instead).")
     parser.add_argument("--ctle-dagger-iterations", type=int, default=4,
                         help="CTLE DAgger iterations per BO trial (default: 4).")
     parser.add_argument("--ctle-epochs-per-iter", type=int, default=100,
@@ -1036,16 +1052,36 @@ def main() -> None:
         param_budget * (1.0 + args.param_tolerance)
         if param_budget is not None else None
     )
+    # Readout family constants for the whole study (shared-sense-crossbar
+    # plan). Map the CLI --readout value onto the builder kwargs exactly as
+    # train_script.py does. ``--readout`` is a fixed study-level categorical:
+    # it never appears inside the sampled arch tuple, so a study.db must not
+    # mix readout modes (the sampling fingerprint guards this). Currently
+    # affects the generic (non-CTLE) construction only — the dagger CTLE
+    # harness is out of scope.
+    bo_readout_mode, bo_readout_senses = {
+        "temporal": ("ota_mesh", 1),
+        "shared": ("shared_sense", 1),
+        "shared-x2": ("shared_sense", 2),
+    }[args.readout]
     print(f"[kn_bayes_opt] param_budget={param_budget} "
           f"param_limit={param_limit} param_reference={param_reference} "
           f"param_tolerance={args.param_tolerance}")
+    print(f"[kn_bayes_opt] readout={args.readout} "
+          f"(readout_mode={bo_readout_mode}, senses_per_node={bo_readout_senses}); "
+          f"seed trial stays the reference temporal config")
 
     # Joint feasible-architecture lists (computed once per study). Every
-    # tuple's build-based param count (bo_param_sampling, cached) is at or
-    # under the soft cap by construction; preflight remains defense-in-depth.
+    # tuple's build-based param count is at or under the soft cap by
+    # construction; preflight remains defense-in-depth.
     soft_limit = int(param_limit) if param_limit is not None else None
     if soft_limit is not None:
         if args.dataset == "ctle":
+            # CTLE Phase-A wired-readout plan §3.2: feasible counts use the
+            # same readout family as the trials that will actually train
+            # (bo_readout_mode / bo_readout_senses from §1055 above). The
+            # fingerprint already includes ``readout``, so resuming against
+            # a mismatched ``study.db`` fails fast.
             knet_ctle_feasible = bps.knet_feasible_arches(
                 soft_limit=soft_limit,
                 in_dim=in_dim, out_dim=out_dim,
@@ -1055,6 +1091,8 @@ def main() -> None:
                 rank_range=(2, 4),
                 fanout_choices=(2,),
                 dagger=True,
+                readout_mode=bo_readout_mode,
+                readout_senses=bo_readout_senses,
                 moe_experts_choices=(2, 3),
                 moe_gate_rank_choices=(1, 2, 3),
                 require_moe=True,
@@ -1072,6 +1110,8 @@ def main() -> None:
                 fanout_choices=tuple(FANOUT_COUNT_CHOICES),
                 use_robust_input=bool(_preset_use_robust(args.dataset)),
                 dagger=False,
+                readout_mode=bo_readout_mode,
+                readout_senses=bo_readout_senses,
             )
             bps.require_feasible(knet_generic_feasible, "KNet", soft_limit)
             knet_ctle_feasible = []
@@ -1089,6 +1129,7 @@ def main() -> None:
         "dataset": args.dataset,
         "param_budget": param_budget,
         "param_tolerance": args.param_tolerance,
+        "readout": args.readout,
         "arch_param_name": "kn_arch_idx",
         "n_arches": len(feasible_now) if feasible_now is not None else 0,
         "ctle_phase_a": bool(args.ctle_phase_a),
@@ -1304,6 +1345,11 @@ def main() -> None:
                     "--phase-a-fwd-weight", f"{args.ctle_phase_a_fwd_weight:.6f}",
                     "--phase-a-power-weight", f"{args.ctle_phase_a_power_weight:.6f}",
                     "--phase-a-power-norm", str(args.ctle_phase_a_power_norm),
+                    # CTLE Phase-A wired-readout plan §3.1: thread the
+                    # study-level readout into every trial. Seed trial
+                    # always runs temporal as the reference anchor, same
+                    # convention as the generic-path trial command below.
+                    "--kn-readout", ("temporal" if is_seed_trial else args.readout),
                     "--output", str(trial_dir),
                     "--device", device,
                     "--seed", str(args.seed),
@@ -1637,6 +1683,9 @@ def main() -> None:
             device_l2_lambda=device_l2_lambda,
             freeze_boundary=freeze_boundary,
             freeze_temporal_read=freeze_temporal_read,
+            # Seed trial (trial 0) always runs the reference temporal
+            # config as a baseline anchor even under a shared readout study.
+            readout=("temporal" if is_seed_trial else args.readout),
             output=trial_dir, device=device,
             boundary_fan_out=seed_boundary_map,
         )
@@ -1813,6 +1862,7 @@ def main() -> None:
 
     with open(run_dir / "best_hyperparams.txt", "w") as f:
         f.write(f"dataset: {args.dataset}\n")
+        f.write(f"readout: {args.readout}\n")
         f.write(f"in_dim: {in_dim}\n")
         f.write(f"out_dim: {out_dim}\n")
         f.write(f"epochs: {args.epochs}\n")
@@ -1875,7 +1925,7 @@ def main() -> None:
     with open(csv_path, "w", newline="") as f:
         w = csv.writer(f)
         w.writerow([
-            "trial", "state", "seed_trial", "num_hidden", "small_world_k",
+            "trial", "state", "seed_trial", "readout", "num_hidden", "small_world_k",
             "small_world_p", "num_stages", "t_span", "num_steps",
             "vca_rank", "fanout_count", "boundary_fan_out", "lr", "weight_decay",
             "batch_size", "x_max", "gm_max", "isat_max", "sparsity_lambda",
@@ -1902,6 +1952,10 @@ def main() -> None:
             w.writerow([
                 t.number, t.state.name,
                 t.user_attrs.get("seed_trial", False),
+                # F5: seed trials always run temporal as a baseline anchor
+                # (see _build_command call above) — label them honestly so
+                # CSV consumers don't mis-attribute the seed readout.
+                ("temporal" if t.user_attrs.get("seed_trial") else args.readout),
                 arch[0],
                 arch[1],
                 SMALL_WORLD_P_FIXED,

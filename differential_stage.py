@@ -16,6 +16,7 @@ passing ``solver='deq'`` to ``forward``.
 
 from __future__ import annotations
 
+import math
 import warnings
 
 import torch
@@ -90,12 +91,16 @@ class DifferentialStage(nn.Module):
             stage has no boundary edges. Default ``False``.
         freeze_temporal_read: When ``True``, temporal-readout edge currents
             (the tanh cell contribution with edge gate + VCA gate folded
-            in) are computed **once** from ``x0`` and held constant across
-            all Heun / DEQ sub-iterations, while the family's resistive
-            shunt (when present) remains dynamic per-step. Mirrors the
-            ``freeze_read`` semantics for the temporal-readout edge family.
-            Independent of ``freeze_read`` and ``freeze_boundary`` (can be
-            combined). No-op when the stage has no temporal-readout edges.
+            in) are computed once from ``x0`` and held constant across all
+            Heun / DEQ iterations. The family's resistive shunt (when
+            present) stays dynamic per-step, mirroring the
+            ``freeze_read`` behavior for the core graph. Independent of
+            ``freeze_read`` and ``freeze_boundary`` (can be combined). No-op
+            when the stage has no temporal-readout edges.
+            In ``readout_mode="shared_sense"`` the same flag dispatches
+            ``_compute_frozen_sense`` (returning ``[B, n_sense]`` per-sense
+            currents) and the shared branch's frozen path uses those as the
+            tanh contribution while the resistive shunt stays dynamic.
             Default ``False``.
         boundary_src: List of input-terminal indices for sparse OTA edges
             from fixed-voltage boundary terminals into the dynamic fabric.
@@ -141,6 +146,31 @@ class DifferentialStage(nn.Module):
             cell type of the core ``cell_lib`` and be sized for
             ``len(output_ode_src)`` edges. Required when
             ``output_ode_src``/``output_ode_dst`` are provided.
+        readout_mode: ``"ota_mesh"`` (default) keeps today's h*d_out
+            temporal-readout OTA mesh (each edge has its own cell, gate, and
+            VCA tap). ``"shared_sense"`` replaces the mesh with one sense
+            OTA per hidden node (optionally two at different operating
+            points, see ``readout_senses_per_node``) plus a plain dense
+            crossbar ``readout_crossbar_W`` that mixes the sense currents
+            into the output-ODE accumulator tail. Exclusive with
+            ``output_ode_src``/``output_ode_dst`` (pass ``None`` for those in
+            shared mode).
+        readout_senses_per_node: ``1`` or ``2``; only meaningful when
+            ``readout_mode="shared_sense"``. ``2`` builds two sense OTAs per
+            hidden node (the second copy is init-jittered by the topology
+            builder so the operating points differ).
+        readout_sense_src: For ``shared_sense`` only: list of source node
+            indices (compact ``0..num_nodes-1``), one entry per sense cell
+            (``s*h`` entries, hidden node ``h`` repeated ``s`` times).
+        readout_sense_cell_lib: For ``shared_sense`` only: per-stage-owned
+            cell library sized ``len(readout_sense_src)``, used to compute
+            sense currents ``I_OTA(x_src_j, Vref)`` against the stage's
+            private learnable ``Vref`` rail.
+        readout_crossbar_shape: For ``shared_sense`` only: ``(d_out,
+            n_sense)`` where ``d_out`` is the number of output-ODE
+            accumulator nodes at the state tail and ``n_sense ==
+            len(readout_sense_src)``. The caller passes the shape explicitly
+            because the stage does not know ``d_out`` directly.
     """
 
     def __init__(
@@ -169,6 +199,11 @@ class DifferentialStage(nn.Module):
 output_ode_src: list[int] | None = None,
         output_ode_dst: list[int] | None = None,
         output_ode_cell_lib: SimpleEdgeLibrary | RealisticTanhLibrary | RealisticTanhUpgradeLibrary | FreeTanhLibrary | AntiParallelFreeTanhLibrary | None = None,
+        readout_mode: str = "ota_mesh",
+        readout_senses_per_node: int = 1,
+        readout_sense_src: list[int] | None = None,
+        readout_sense_cell_lib: SimpleEdgeLibrary | RealisticTanhLibrary | RealisticTanhUpgradeLibrary | FreeTanhLibrary | AntiParallelFreeTanhLibrary | None = None,
+        readout_crossbar_shape: tuple[int, int] | None = None,
         vca_enabled: bool = False,
         vca_rank: int = 2,
         vca_in_dim: int = 0,
@@ -436,6 +471,110 @@ output_ode_src: list[int] | None = None,
             self.output_ode_z_logits = None
             self._has_output_ode = False
 
+        # Shared-sense + crossbar readout (shared-sense-crossbar plan).
+        # Replaces the h*d_out temporal OTA mesh with one sense OTA per
+        # hidden node (optionally two at different operating points) driven
+        # against a private learnable Vref rail, plus a plain dense crossbar
+        # W [d_out x s*h] that mixes the sense currents into the last d_out
+        # output-ODE accumulator nodes (the readout tail). The crossbar is a
+        # plain nn.Parameter — no z_logits, no VCA on the taps. VCA
+        # (``vca_v_readout``) gates the sense currents only.
+        self.readout_mode = str(readout_mode)
+        self.readout_senses_per_node = int(readout_senses_per_node)
+        self._has_shared_readout = False
+        self._sense_has_resistive = False
+        self._readout_dst_start = 0
+        if self.readout_mode not in ("ota_mesh", "shared_sense"):
+            raise ValueError(
+                f"DifferentialStage: readout_mode must be 'ota_mesh' or "
+                f"'shared_sense', got {readout_mode!r}"
+            )
+        if self.readout_senses_per_node not in (1, 2):
+            raise ValueError(
+                f"DifferentialStage: readout_senses_per_node must be 1 or 2, "
+                f"got {self.readout_senses_per_node}"
+            )
+        if self.readout_mode == "shared_sense":
+            if (
+                readout_sense_src is None
+                or readout_sense_cell_lib is None
+                or readout_crossbar_shape is None
+            ):
+                raise ValueError(
+                    "DifferentialStage: shared_sense readout requires "
+                    "readout_sense_src, readout_sense_cell_lib, and "
+                    "readout_crossbar_shape"
+                )
+            if output_ode_src is not None or output_ode_dst is not None:
+                raise ValueError(
+                    "DifferentialStage: shared_sense readout is incompatible "
+                    "with output_ode_src/output_ode_dst (the legacy temporal "
+                    "mesh); pass None for those in shared mode"
+                )
+            s = self.readout_senses_per_node
+            n_sense = len(readout_sense_src)
+            if n_sense <= 0:
+                raise ValueError(
+                    "DifferentialStage: shared_sense readout needs at least "
+                    "one sense cell"
+                )
+            if n_sense % s != 0:
+                raise ValueError(
+                    f"DifferentialStage: len(readout_sense_src)={n_sense} must "
+                    f"be divisible by readout_senses_per_node={s}"
+                )
+            if any(
+                i < 0 or i >= self.num_nodes for i in readout_sense_src
+            ):
+                raise ValueError(
+                    f"DifferentialStage: readout_sense_src entries must be in "
+                    f"[0, {self.num_nodes}), got {readout_sense_src}"
+                )
+            d_out, crossbar_sense = readout_crossbar_shape
+            if int(crossbar_sense) != n_sense:
+                raise ValueError(
+                    f"DifferentialStage: readout_crossbar_shape[1]="
+                    f"{crossbar_sense} must equal len(readout_sense_src)="
+                    f"{n_sense}"
+                )
+            if int(d_out) <= 0 or int(d_out) >= self.num_nodes:
+                raise ValueError(
+                    f"DifferentialStage: readout_crossbar_shape[0]={d_out} must "
+                    f"be in (0, num_nodes={self.num_nodes}) so the readout tail "
+                    f"is a proper slice of the state"
+                )
+            self.register_buffer(
+                "readout_sense_src",
+                torch.tensor(readout_sense_src, dtype=torch.long),
+            )
+            self.readout_sense_cell_lib = readout_sense_cell_lib
+            self.readout_sense_z_logits = nn.Parameter(
+                torch.full((n_sense,), z_init),
+            )
+            self.readout_crossbar_W = nn.Parameter(
+                torch.randn(int(d_out), n_sense) * (1.0 / math.sqrt(n_sense))
+            )
+            self.raw_vref_sense = nn.Parameter(
+                torch.tensor([float(REF["raw_vref_init"])], dtype=torch.float32)
+            )
+            self._readout_dst_start = self.num_nodes - int(d_out)
+            self._has_shared_readout = True
+            self._sense_has_resistive = hasattr(
+                readout_sense_cell_lib, "resistive_current"
+            )
+        else:
+            # ota_mesh mode: no shared-readout state is created at all (the
+            # empty ``output_ode_*`` buffers above already exist on legacy
+            # stages) so legacy state_dicts stay byte-identical and old
+            # temporal checkpoints keep loading with strict=True.
+            self.readout_sense_cell_lib = None
+            self.readout_sense_z_logits = None
+            self.readout_crossbar_W = None
+            self.raw_vref_sense = None
+            self._has_shared_readout = False
+            self._sense_has_resistive = False
+            self._readout_dst_start = 0
+
         # Low-rank input-driven VCA (Voltage-Controlled Amplifier) gating.
         # When enabled, builds per-edge embeddings for boundary,
         # temporal-readout, and optionally core edges plus a shared input
@@ -458,10 +597,19 @@ output_ode_src: list[int] | None = None,
         # boundary / temporal-readout / core edge families.
         if self.vca_enabled:
             n_b = int(self.boundary_src.numel())
-            n_r = int(self.output_ode_src.numel())
+            # In shared_sense mode the "readout" family is the sense bank
+            # (s*h cells); in ota_mesh mode it is the legacy h*d_out mesh.
+            # The VCA readout embeddings size to the active readout family.
+            n_r = (
+                int(self.readout_sense_src.numel())
+                if self._has_shared_readout
+                else int(self.output_ode_src.numel())
+            )
             n_c = int(self.src.numel())
             # Core gating is auto-enabled when VCA is on but neither
-            # boundary nor temporal-readout edges exist (run C ablation).
+            # boundary nor readout edges exist (run C ablation). The
+            # shared sense bank counts as a readout family (so shared mode
+            # never spuriously auto-enables core gating).
             self._vca_core_enabled = bool(
                 vca_core_enabled or (n_b == 0 and n_r == 0)
             )
@@ -817,7 +965,15 @@ output_ode_src: list[int] | None = None,
         mirroring the Heun-path ``freeze_read`` behavior for the core
         family. Returns ``None`` when readout edges are absent (so
         ``freeze_temporal_read`` becomes a no-op as expected).
+
+        NOTE: the return shape is mode-dependent. In ``ota_mesh`` mode this
+        is the legacy ``[batch, num_nodes]`` accumulator tensor. In
+        ``shared_sense`` mode this dispatches to :meth:`_compute_frozen_sense`
+        and returns ``[batch, n_sense]`` per-sense currents (the crossbar
+        matmul happens inside ``rhs``).
         """
+        if self._has_shared_readout and self.readout_sense_src.numel() > 0:
+            return self._compute_frozen_sense(u, x0)
         if not self._has_output_ode or self.output_ode_src.numel() == 0:
             return None
         x_src0 = x0[:, self.output_ode_src]
@@ -838,6 +994,50 @@ output_ode_src: list[int] | None = None,
         acc_o = torch.zeros_like(x0, dtype=torch.float32)
         acc_o.index_add_(1, self.output_ode_dst, i_edge.float())
         return acc_o.to(dtype=x0.dtype)
+
+    def _compute_frozen_sense(
+        self, u: torch.Tensor | None, x0: torch.Tensor,
+    ) -> torch.Tensor | None:
+        """Precompute the frozen shared-sense tanh KCL contribution.
+
+        Mirrors :meth:`_compute_frozen_readout` for the shared_sense family:
+        the sense currents ``I_OTA(x0[:, readout_sense_src], Vref)`` are
+        computed once from ``(u, x0)`` at stage entry, multiplied by the
+        per-sense gate ``sigmoid(readout_sense_z_logits)`` and — when VCA is
+        enabled — the per-edge VCA gate (which requires ``u``).
+
+        Unlike the legacy mesh path this returns **per-sense** currents of
+        shape ``[batch, n_sense]`` (NOT a scattered ``[batch, num_nodes]``
+        accumulator): the dense crossbar matmul happens inside ``rhs`` so the
+        frozen/dynamic split stays clean (frozen tanh senses x dynamic
+        crossbar ``W``). The family's resistive shunt is NOT folded in; it is
+        recomputed from evolving voltages each rhs call. Returns ``None``
+        when shared readout is absent.
+        """
+        if not self._has_shared_readout or self.readout_sense_src.numel() == 0:
+            return None
+        x_src0 = x0[:, self.readout_sense_src]            # [B, n_sense]
+        cell_lib = self.readout_sense_cell_lib
+        # Sense destination is the private Vref rail (an ideal voltage
+        # source held constant during integration). Pass it as the
+        # FreeTanh ``x_dst`` argument so the cell is reused exactly.
+        vref = torch.sigmoid(self.raw_vref_sense) * self.x_max
+        x_dst0 = vref.to(x0.dtype).view(1, 1).expand_as(x_src0)
+        if hasattr(cell_lib, "forward_tanh"):
+            i_edge = cell_lib.forward_tanh(
+                x_src=x_src0, x_dst=x_dst0, x_max=self.x_max,
+            )
+        else:
+            i_edge = cell_lib(
+                x_src=x_src0, x_dst=x_dst0, x_max=self.x_max,
+            )
+        sense_mask = torch.sigmoid(self.readout_sense_z_logits)  # [n_sense]
+        i_edge = i_edge * sense_mask.unsqueeze(0)
+        if self.vca_enabled and self.vca_v_readout is not None and u is not None:
+            i_edge = i_edge * self._compute_vca_gate(
+                u, self.vca_v_readout, self.vca_b_readout,
+            )
+        return i_edge.to(dtype=x0.dtype)  # [B, n_sense]
 
     def _compute_i_edge_const(
         self,
@@ -940,6 +1140,19 @@ output_ode_src: list[int] | None = None,
           path) the tanh cell contribution + edge gate + VCA gate are
           precomputed once from ``x0`` and the per-step block only
           recomputes the family's resistive shunt (when present).
+
+        Shared-sense + crossbar readout (shared-sense-crossbar plan):
+        - When ``self._has_shared_readout`` (mutually exclusive with the
+          legacy mesh), one sense OTA per hidden node drives against a
+          private learnable ``Vref`` rail; the per-sense currents are mixed
+          by a plain dense crossbar ``readout_crossbar_W`` and injected into
+          the last ``d_out`` output-ODE accumulator nodes only (no source
+          drain). The family is NOT frozen by ``freeze_read`` (the sense
+          sources evolve). When ``i_readout_const`` is provided
+          (``freeze_temporal_read=True``) its shape is ``[B, n_sense]`` in
+          shared mode (mode-dependent: ``[B, num_nodes]`` in the legacy mesh
+          path) and the per-step block only recomputes the family's
+          resistive shunt (when present).
         """
         x_src = x[:, self.src]
         x_dst = x[:, self.dst]
@@ -1132,6 +1345,63 @@ output_ode_src: list[int] | None = None,
                     acc_out_res.index_add_(1, self.output_ode_dst, i_res_o.float())
                     # NOTE: no source drain on output_ode_src.
                     acc = (acc.float() + acc_out_res).to(dtype=x.dtype)
+
+        # Shared-sense + crossbar readout (shared-sense-crossbar plan).
+        # Mutually exclusive with the legacy temporal mesh above (in shared
+        # mode ``self._has_output_ode`` is False). Dynamics:
+        #   I_j = Isat_j * tanh(gm_j * (A_j * x_src_j - B_j * Vref + theta_j))
+        #        (+ leaky-ALPHA term + resistive shunt, unchanged)
+        #   a_dot_i = sum_j W[i, j] * I_j - leak_i * a_i - clip_i(a_i)
+        # where ``a`` is the last ``d_out`` output-ODE accumulator slice and
+        # the crossbar ``W`` is a plain dense weight (no gate, no VCA). VCA
+        # gates the sense currents only.
+        if self._has_shared_readout and self.readout_sense_src.numel() > 0:
+            W = self.readout_crossbar_W                    # [d_out, n_sense]
+            sense_mask = torch.sigmoid(self.readout_sense_z_logits)  # [n_sense]
+            x_j = x[:, self.readout_sense_src]             # [B, n_sense]
+            vref = (torch.sigmoid(self.raw_vref_sense) * self.x_max).to(x.dtype)
+            x_dst_s = vref.view(1, 1).expand_as(x_j)
+            if i_readout_const is None:
+                # Dynamic path: full cell forward (tanh + resistive shunt).
+                i_s = self.readout_sense_cell_lib(
+                    x_src=x_j, x_dst=x_dst_s, x_max=self.x_max,
+                )
+                i_s = i_s * sense_mask.unsqueeze(0)        # [B, n_sense]
+                if self.vca_enabled and self.vca_v_readout is not None and u is not None:
+                    i_s = i_s * self._compute_vca_gate(
+                        u, self.vca_v_readout, self.vca_b_readout,
+                    )  # [B, n_sense]
+            else:
+                # Frozen-tanh path (freeze_temporal_read=True): the tanh cell
+                # contribution (sense gate + VCA gate already folded in at
+                # precompute time) arrives as ``[B, n_sense]``; the family's
+                # resistive shunt is recomputed below from evolving voltages.
+                i_s = i_readout_const
+            i_acc = (i_s.float() @ W.float().T)            # [B, d_out]
+            if i_edge_const is not None:
+                acc = acc.clone()
+            acc_f32 = acc.float()
+            dst_slice = slice(self._readout_dst_start, self.num_nodes)
+            acc_f32[:, dst_slice] = (
+                acc_f32[:, dst_slice] + i_acc.to(dtype=acc_f32.dtype)
+            )
+            acc = acc_f32.to(dtype=x.dtype)
+            # Resistive shunt stays dynamic per-step like every other family
+            # (kept for exact FreeTanh reuse even though Vref is an ideal
+            # source). Gate matches the tanh path so it can be pruned away.
+            if i_readout_const is not None and self._sense_has_resistive:
+                i_res_s = self.readout_sense_cell_lib.resistive_current(x_j, x_dst_s)
+                i_res_s = i_res_s * sense_mask.unsqueeze(0)
+                if self.vca_enabled and self.vca_v_readout is not None and u is not None:
+                    i_res_s = i_res_s * self._compute_vca_gate(
+                        u, self.vca_v_readout, self.vca_b_readout,
+                    )  # [B, n_sense]
+                i_res_acc = (i_res_s.float() @ W.float().T)  # [B, d_out]
+                acc_f32 = acc.float()
+                acc_f32[:, dst_slice] = (
+                    acc_f32[:, dst_slice] + i_res_acc.to(dtype=acc_f32.dtype)
+                )
+                acc = acc_f32.to(dtype=x.dtype)
 
         leak = self._effective_leak(leak_floor=leak_floor).unsqueeze(0).to(x.device)  # [1, N]
         leak_term = leak * x
@@ -1827,6 +2097,55 @@ output_ode_src: list[int] | None = None,
                     out_dev += int(self.output_ode_cell_lib.theta_raw.numel())
                 if hasattr(self.output_ode_cell_lib, "kappa_raw"):
                     out_dev += int(self.output_ode_cell_lib.kappa_raw.numel())
+        # Shared-sense readout stats (shared-sense-crossbar plan). Zero in
+        # the legacy ota_mesh mode where the output_ode_* keys above are
+        # populated instead.
+        sense_z = (
+            int(self.readout_sense_z_logits.numel())
+            if getattr(self, "readout_sense_z_logits", None) is not None else 0
+        )
+        sense_dev = 0
+        if self._has_shared_readout and self.readout_sense_cell_lib is not None:
+            # Same per-type counting ladder as the output_ode block above,
+            # plus the FreeTanh resistive shunt (F6: legacy ladders
+            # propagate the same omission, but the sense bank must include
+            # ``g_resistive_raw`` since ``--no-resistive-shunt`` zeroes it).
+            if hasattr(self.readout_sense_cell_lib, "param"):
+                sense_dev = int(self.readout_sense_cell_lib.param.numel())
+            elif hasattr(self.readout_sense_cell_lib, "alpha_raw"):
+                sense_dev = int(self.readout_sense_cell_lib.alpha_raw.numel())
+                if hasattr(self.readout_sense_cell_lib, "bias_raw"):
+                    sense_dev += int(self.readout_sense_cell_lib.bias_raw.numel())
+            elif hasattr(self.readout_sense_cell_lib, "gm_raw"):
+                sense_dev = int(self.readout_sense_cell_lib.gm_raw.numel())
+                if hasattr(self.readout_sense_cell_lib, "isat_raw"):
+                    sense_dev += int(self.readout_sense_cell_lib.isat_raw.numel())
+                if hasattr(self.readout_sense_cell_lib, "a_raw"):
+                    sense_dev += int(self.readout_sense_cell_lib.a_raw.numel())
+                if hasattr(self.readout_sense_cell_lib, "b_raw"):
+                    sense_dev += int(self.readout_sense_cell_lib.b_raw.numel())
+                if hasattr(self.readout_sense_cell_lib, "s_raw"):
+                    sense_dev += int(self.readout_sense_cell_lib.s_raw.numel())
+                if hasattr(self.readout_sense_cell_lib, "theta_raw"):
+                    sense_dev += int(self.readout_sense_cell_lib.theta_raw.numel())
+                if hasattr(self.readout_sense_cell_lib, "kappa_raw"):
+                    sense_dev += int(self.readout_sense_cell_lib.kappa_raw.numel())
+                if hasattr(self.readout_sense_cell_lib, "g_resistive_raw"):
+                    sense_dev += int(self.readout_sense_cell_lib.g_resistive_raw.numel())
+                if getattr(self.readout_sense_cell_lib, "_parallel_tanh_mult_enabled", False):
+                    sense_dev += (
+                        int(self.readout_sense_cell_lib.gm_x_raw.numel())
+                        + int(self.readout_sense_cell_lib.gm_y_raw.numel())
+                        + int(self.readout_sense_cell_lib.isat_parallel_raw.numel())
+                    )
+        sense_crossbar = (
+            int(self.readout_crossbar_W.numel())
+            if getattr(self, "readout_crossbar_W", None) is not None else 0
+        )
+        sense_vref = (
+            int(self.raw_vref_sense.numel())
+            if getattr(self, "raw_vref_sense", None) is not None else 0
+        )
         vca_proj_n = int(self.vca_W.numel()) if self.vca_W is not None else 0
         if getattr(self, "vca_W_core", None) is not None:
             vca_proj_n += int(self.vca_W_core.numel())
@@ -1854,6 +2173,10 @@ output_ode_src: list[int] | None = None,
             "ref_device_param": ref_device_n,
             "output_ode_z_logits": out_z,
             "output_ode_device_param": out_dev,
+            "readout_sense_z_logits": sense_z,
+            "readout_sense_device_param": sense_dev,
+            "readout_crossbar": sense_crossbar,
+            "raw_vref_sense": sense_vref,
             "vca_proj": vca_proj_n,
             "vca_embed": vca_embed_n,
             "vca_bias": vca_bias_n,
@@ -1868,6 +2191,10 @@ output_ode_src: list[int] | None = None,
                 + ref_device_n
                 + out_z
                 + out_dev
+                + sense_z
+                + sense_dev
+                + sense_crossbar
+                + sense_vref
                 + vca_proj_n
                 + vca_embed_n
                 + vca_bias_n

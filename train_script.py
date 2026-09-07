@@ -728,6 +728,8 @@ def _save_config_snapshot(out_dir: Path, problem: str, args, lambdas: dict,
     snap_path = out_dir / "config_snapshot.txt"
     with open(snap_path, "w") as f:
         f.write(f"problem: {problem}\n")
+        f.write(f"readout: {getattr(args, 'readout', 'temporal')}\n")
+        f.write(f"freeze_temporal_read: {getattr(args, 'freeze_temporal_read', False)}\n")
         f.write(f"preset: {PRESETS[problem]}\n\n")
         f.write("LAMBDAS (global):\n")
         for k, v in LAMBDAS.items():
@@ -1898,13 +1900,22 @@ def collect_gradient_norms(raw_net):
 
     # First pass: register all expected keys (even when grads are None),
     # so callers always find them in the dict.
+    # F7: match any ``*_cell_lib.*`` device-family suffix, not just the
+    # core ``.cell_lib.``, so boundary / output_ode / ref / shared-sense
+    # device params also register into ``stage{i}_device_param``.
     for name, p in raw_net.named_parameters():
         if ".stages." in name:
             for comp in stage_components:
                 if name.endswith("." + comp):
                     stage_idx = int(name.split(".stages.")[1].split(".")[0])
                     stage_sq.setdefault(f"stage{stage_idx}_{comp}", 0.0)
-            if any(name.endswith(".cell_lib." + s) for s in device_param_suffixes):
+            if any(
+                name.endswith("." + lib_prefix + "." + s)
+                for lib_prefix in ("cell_lib", "boundary_cell_lib",
+                                   "output_ode_cell_lib", "ref_cell_lib",
+                                   "readout_sense_cell_lib")
+                for s in device_param_suffixes
+            ):
                 stage_idx = int(name.split(".stages.")[1].split(".")[0])
                 stage_sq.setdefault(f"stage{stage_idx}_device_param", 0.0)
 
@@ -1919,7 +1930,16 @@ def collect_gradient_norms(raw_net):
                     stage_idx = int(name.split(".stages.")[1].split(".")[0])
                     key = f"stage{stage_idx}_{comp}"
                     stage_sq[key] = stage_sq.get(key, 0.0) + gnorm_sq
-            if any(name.endswith(".cell_lib." + s) for s in device_param_suffixes):
+            # F7: also accumulate non-core cell families (boundary, mesh,
+            # ref, shared-sense) into the stage device-param bucket so
+            # grad_log reflects every FreeTanh/Realistic family.
+            if any(
+                name.endswith("." + lib_prefix + "." + s)
+                for lib_prefix in ("cell_lib", "boundary_cell_lib",
+                                   "output_ode_cell_lib", "ref_cell_lib",
+                                   "readout_sense_cell_lib")
+                for s in device_param_suffixes
+            ):
                 stage_idx = int(name.split(".stages.")[1].split(".")[0])
                 key = f"stage{stage_idx}_device_param"
                 stage_sq[key] = stage_sq.get(key, 0.0) + gnorm_sq
@@ -2662,19 +2682,38 @@ def _add_argparse_args(parser: argparse.ArgumentParser) -> None:
              "same width. Incompatible with --decoder-type residual_tanh "
              "and --grouped-readout. Default: disabled.")
     parser.add_argument(
+        "--readout", choices=["linear", "temporal", "shared", "shared-x2"],
+        default="temporal", dest="readout",
+        help="Readout family. 'temporal' = h*d_out OTA mesh (default): every "
+             "hidden node connects to every output-ODE accumulator via its own "
+             "FreeTanh cell + edge gate + VCA tap, then OutputAffine reads the "
+             "accumulator tail. 'linear' = pre-refactor default: linear "
+             "OutputMapper reads from projection nodes (or hidden nodes if no "
+             "projection), NO output-ODE accumulator tail, NO OutputAffine. "
+             "'shared' = one FreeTanh sense OTA per hidden node driven against "
+             "a per-stage learnable Vref rail + a plain dense crossbar "
+             "W[d_out x h] mixing the sense currents into the accumulator "
+             "tail. 'shared-x2' = two senses per hidden node (different gm "
+             "operating points) + W[d_out x 2h]. The crossbar is plain dense "
+             "weights (no gates, no VCA); VCA gates the senses only. "
+             "Deprecated alias: --temporal-readout selects 'temporal'; "
+             "combining it with --readout linear/shared/shared-x2 is an error.")
+    parser.add_argument(
         "--vca", action="store_true", default=False,
         dest="vca",
         help="Enable low-rank input-driven VCA (Voltage-Controlled Amplifier) "
-             "gating on boundary and temporal-readout edges. Each gated "
-             "edge's tail current is modulated by vca_e = 2*sigmoid(u^T W v_e), "
-             "where W (in_dim x rank) is a shared input projection and v_e "
-             "(rank) is a per-edge embedding. Physically: rank global control "
-             "buses broadcast from the input terminals, each unfrozen edge "
-             "taps into them with a programmable weight. Provides "
-             "content-dependent multiplicative cross-node interaction "
-             "(attention analog). Compatible with --freeze-read because u is "
-             "constant per sample across all sub-iterations. Requires at "
-             "least one of --boundary-fan-out or --temporal-readout. "
+             "gating on boundary and readout edges. Each gated edge's tail "
+             "current is modulated by vca_e = 2*sigmoid(u^T W v_e), where W "
+             "(in_dim x rank) is a shared input projection and v_e (rank) is "
+             "a per-edge embedding. Physically: rank global control buses "
+             "broadcast from the input terminals, each unfrozen edge taps into "
+             "them with a programmable weight. Provides content-dependent "
+             "multiplicative cross-node interaction (attention analog). "
+             "Compatible with --freeze-read because u is constant per sample "
+             "across all Heun/DEQ sub-iterations. Requires at least one of "
+             "--boundary-fan-out or a readout tail family "
+             "(--readout temporal/shared/shared-x2); in shared-sense mode the "
+             "VCA gates the sense bank instead of a temporal mesh. "
              "Default: disabled.")
     parser.add_argument(
         "--vca-rank", type=int, default=None, dest="vca_rank",
@@ -2691,13 +2730,13 @@ def _add_argparse_args(parser: argparse.ArgumentParser) -> None:
         "--vca-core", action="store_true", default=False,
         dest="vca_core",
         help="Enable VCA gating on core (hidden) edges in addition to "
-             "boundary/temporal-readout edges. Computed once per sample at "
+             "boundary/readout edges. Computed once per sample at "
              "stage entry (u is constant per sample across all Heun/DEQ "
              "sub-iterations), so the gate folds into the freeze_read "
              "precompute with zero extra cost in the Heun loop. "
-             "Auto-enabled when --vca is on but neither --boundary-fan-out "
-             "nor --temporal-readout are present. Default: disabled "
-             "unless no other gated family exists.")
+             "Auto-enabled when --vca is on but no gated family exists "
+             "(--boundary-fan-out nor a --readout temporal/shared/shared-x2 "
+             "family). Default: disabled unless no other gated family exists.")
     parser.add_argument(
         "--vca-gate-shunt", action="store_true", default=False,
         dest="vca_gate_shunt",
@@ -3554,6 +3593,35 @@ def main():
                 f"--vca-rank must be >= {VCA['min_rank']}, got {vca_rank_eff}"
             )
 
+    # Readout family resolution (shared-sense-crossbar plan).
+    #   --readout linear      = pre-refactor default: linear OutputMapper,
+    #                           no accumulator tail, no OutputAffine.
+    #   --readout temporal    = legacy h*d_out OTA mesh
+    #   --readout shared      = one sense OTA per hidden node + dense crossbar
+    #   --readout shared-x2   = two senses per node (different gm operating
+    #                           points) + crossbar over 2h senses
+    # --temporal-readout (deprecated) is an alias for '--readout temporal';
+    # combining it with an explicit linear/shared* choice is contradictory.
+    readout_to_mode = {
+        "linear": ("ota_mesh", 1),
+        "temporal": ("ota_mesh", 1),
+        "shared": ("shared_sense", 1),
+        "shared-x2": ("shared_sense", 2),
+    }
+    if args.enable_temporal_readout and args.readout != "temporal":
+        raise ValueError(
+            f"--temporal-readout is a deprecated alias for '--readout temporal' "
+            f"and cannot be combined with --readout {args.readout}."
+        )
+    readout_mode, readout_senses = readout_to_mode[args.readout]
+    # The accumulator tail (``out_dim`` output-ODE nodes appended to every
+    # stage + OutputAffine read) is built for the three OTA-tail families
+    # (``temporal``, ``shared``, ``shared-x2``) and skipped for ``linear``,
+    # which uses the pre-refactor linear OutputMapper over projection nodes.
+    # ``readout_mode`` / ``readout_senses`` switch only the edge family inside
+    # build_net_from_config; the tail toggle is a separate boolean.
+    enable_temporal_readout = (args.readout != "linear")
+
     net = build_net_from_preset(
         args.problem,
         cell_lib=cell_lib,
@@ -3578,7 +3646,9 @@ def main():
         enable_skip_linear=args.skip_linear,
         boundary_fan_out=boundary_fan_out_parsed,
         enable_ref_edges=args.enable_ref_edges,
-        enable_temporal_readout=args.enable_temporal_readout,
+        enable_temporal_readout=enable_temporal_readout,
+        readout_mode=readout_mode,
+        readout_senses_per_node=readout_senses,
         vca_enabled=args.vca,
         vca_rank=args.vca_rank,
         vca_bias=args.vca_bias,
@@ -3605,7 +3675,10 @@ def main():
             if hasattr(stage, 'output_ode_z_logits') and stage.output_ode_z_logits is not None:
                 stage.output_ode_z_logits.data.fill_(10.0)
                 stage.output_ode_z_logits.requires_grad_(False)
-        print("[train] --no-edge-gates: z_logits (core + boundary + ref + temporal-readout) frozen to +10 (all edges permanently on)")
+            if hasattr(stage, 'readout_sense_z_logits') and stage.readout_sense_z_logits is not None:
+                stage.readout_sense_z_logits.data.fill_(10.0)
+                stage.readout_sense_z_logits.requires_grad_(False)
+        print("[train] --no-edge-gates: z_logits (core + boundary + ref + temporal-readout + shared-sense) frozen to +10 (all edges permanently on)")
 
     # --no-resistive-shunt: bypass the parallel resistive shunt across all
     # stages (no-resistive-shunt). Sets _has_resistive=False so rhs() skips
@@ -3621,6 +3694,17 @@ def main():
                 stage._has_resistive = False
                 stage.cell_lib.g_resistive_raw.data.zero_()
                 stage.cell_lib.g_resistive_raw.requires_grad_(False)
+                n_disabled += 1
+            # Shared-sense readout family: disable its resistive shunt too
+            # (rhs() checks ``stage._sense_has_resistive``; the zeroed +
+            # frozen g_resistive_raw also zeroes the static forward path).
+            sense_lib = getattr(stage, "readout_sense_cell_lib", None)
+            if getattr(stage, "_has_shared_readout", False) and isinstance(
+                sense_lib, _FreeTanhLibrary
+            ) and stage._sense_has_resistive:
+                stage._sense_has_resistive = False
+                sense_lib.g_resistive_raw.data.zero_()
+                sense_lib.g_resistive_raw.requires_grad_(False)
                 n_disabled += 1
         print(f"[train] resistive shunt disabled on {n_disabled} "
               f"stage(s) (--no-resistive-shunt)")
@@ -3641,6 +3725,7 @@ def main():
         f"hid_count={net.hid_count} proj_count={net.proj_count} "
         f"write_idx={list(net.write_idx) if net.write_idx is not None else None} "
         f"read_idx={list(net.read_idx) if net.read_idx is not None else None} "
+        f"readout={args.readout} "
         f"freeze_read={args.freeze_read} "
         f"freeze_boundary={args.freeze_boundary} "
         f"freeze_temporal_read={args.freeze_temporal_read}"
@@ -3676,26 +3761,46 @@ def main():
             and isinstance(s.output_ode_cell_lib, _FreeTanhLibrary)
             for s in net.core.stages
         )
+        n_sense = sum(
+            getattr(s, "_has_shared_readout", False)
+            and getattr(s, "readout_sense_cell_lib", None) is not None
+            and isinstance(s.readout_sense_cell_lib, _FreeTanhLibrary)
+            for s in net.core.stages
+        )
         print(
             f"[train] device L2 penalty ENABLED: lambda={args.device_l2_lambda:.2e} "
             f"(scale-invariant mean over FreeTanh cell params, "
-            f"interstage residual weights, OutputAffine, VCA; s_raw skipped). "
+            f"interstage residual weights, OutputAffine, VCA; s_raw skipped; "
+            f"shared-sense params + dense crossbar readout_crossbar_W are "
+            f"included as plain L2 targets, not the scale-invariant device "
+            f"path). "
             f"tanh_free cell_lib families: core={n_tanh_free}, "
-            f"boundary={n_boundary}, temporal-readout={n_temporal}"
+            f"boundary={n_boundary}, temporal-readout={n_temporal}, "
+            f"shared-sense={n_sense}"
         )
     if getattr(net, "enable_vca", False):
         vca_rank_eff = net.vca_rank if hasattr(net, "vca_rank") else VCA["rank"]
         n_b_edges = sum(
             len(s.boundary_src) for s in net.core.stages if hasattr(s, "boundary_src")
         )
+        # Shared-sense readout: the gated readout family is the sense bank
+        # (s*h cells); otherwise the legacy h*d_out temporal mesh. ``linear``
+        # mode has no readout tail at all so the gated family is empty.
         n_r_edges = sum(
-            len(s.output_ode_src)
+            (len(s.readout_sense_src) if getattr(s, "_has_shared_readout", False)
+             else len(s.output_ode_src))
             for s in net.core.stages
-            if hasattr(s, "output_ode_src")
+            if hasattr(s, "readout_sense_src") or hasattr(s, "output_ode_src")
         )
+        if args.readout == "shared" or args.readout == "shared-x2":
+            label_r = "shared-sense"
+        elif args.readout == "temporal":
+            label_r = "temporal-readout"
+        else:
+            label_r = "(no readout tail)"
         print(
             f"[train] VCA ENABLED: rank={vca_rank_eff}, "
-            f"total gated edges: {n_b_edges} boundary + {n_r_edges} temporal-readout"
+            f"total gated edges: {n_b_edges} boundary + {n_r_edges} {label_r}"
         )
     # Resolve the actually-applied edge_repeats from the preset (post the
     # CLI-injection step). When multiple stages disagree, fall back to None.

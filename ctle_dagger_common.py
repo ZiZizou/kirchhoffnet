@@ -3285,6 +3285,12 @@ def run_phase_a_training(student, ctx, *, model_name: str = "phase_a_student"):
             "power_weight": power_weight,
             "power_norm_const": power_norm_const,
             "schema_rev": schema_rev,
+            # B3: record which readout family the student was built with so
+            # downstream consumers (BO logs, ablation analyses) can attribute
+            # results to the right architecture without parsing the trial
+            # command. Falls back to the legacy temporal mesh when the
+            # student predates the wired-readout plan.
+            "kn_readout": getattr(student, "kn_readout", "temporal"),
         }}, handle, indent=2, default=str)
     _logger.info(f"[phaseA] wrote {log_path}")
     _logger.info(
