@@ -902,10 +902,15 @@ def install_linear_reservoir_v2(
                     b_src = getattr(stage, "_lin_injection_src", None)
                     b_dst = getattr(stage, "_lin_injection_dst", None)
                     if b_src is not None and b_dst is not None and G_in_t.numel() > 0:
-                        u_src = u[:, b_src]
+                        # Index tensors are plain CPU attributes (setattr
+                        # does not register buffers), so they must follow
+                        # the state/input device explicitly (CUDA run).
+                        b_src_d = b_src.to(u.device)
+                        b_dst_d = b_dst.to(x.device)
+                        u_src = u[:, b_src_d]
                         i_b = G_in_t.to(u.device, u.dtype).unsqueeze(0) * u_src
                         acc_b = torch.zeros_like(acc)
-                        acc_b.index_add_(1, b_dst, i_b)
+                        acc_b.index_add_(1, b_dst_d, i_b)
                         acc = acc + acc_b
         # Leak.
         leak = stage._effective_leak(leak_floor=leak_floor).unsqueeze(0).to(x.device, x.dtype)
