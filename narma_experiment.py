@@ -485,8 +485,14 @@ def memory_capacity(states: torch.Tensor, targets: torch.Tensor,
         if T - k <= 0:
             r2_list.append(0.0)
             continue
-        X = states[: T - k]
-        y = targets[k:]
+        # k-step-BACK reconstruction: current states ``states[k:]``
+        # predict past targets ``targets[:T-k]`` (row i pairs state
+        # ``i+k`` with input ``i``).  The previous convention paired
+        # ``states[:T-k]`` with ``targets[k:]`` (past states predicting
+        # future targets), under which even a perfect delay line scores
+        # MC ~= 0 (verified: 0.022 on a noiseless 1-step delay).
+        X = states[k:]
+        y = targets[: T - k]
         X_aug = torch.cat([X, torch.ones(X.shape[0], 1, device=X.device)], dim=1)
         XtX = X_aug.T @ X_aug + ridge_l2 * torch.eye(X_aug.shape[1], device=X.device)
         W = torch.linalg.solve(XtX, X_aug.T @ y)
