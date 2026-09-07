@@ -1313,9 +1313,9 @@ def _esn_jacobian_eigs(
         u_next = float(u_seq[t + 1].item())
         pre = W @ x + W_in * u_next
         gain = 1.0 - torch.tanh(pre).pow(2)
-        J = (1.0 - leak) * torch.eye(n_nodes, dtype=torch.float64) + leak * (
-            gain.unsqueeze(1) * W
-        )
+        J = (1.0 - leak) * torch.eye(
+            n_nodes, dtype=torch.float64, device=dev
+        ) + leak * (gain.unsqueeze(1) * W)
         try:
             eig = torch.linalg.eigvals(J)
             abs_e = eig.abs()
