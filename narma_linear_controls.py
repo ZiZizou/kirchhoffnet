@@ -327,6 +327,8 @@ def _instrument_trajectory(
             f"{states_full.shape[0]}, {u_seq.shape[0]}, {y_seq.shape[0]} "
             f"with washout={washout}"
         )
+    u_seq = u_seq.to(states_full.device)
+    y_seq = y_seq.to(states_full.device)
     x_max = float(stage.x_max)
     with torch.no_grad():
         sat_max = float(states_full.abs().max().item())
@@ -393,6 +395,7 @@ def _per_delay_mc(
     washout: int, max_delay: int = 20, ridge_l2: float = 1e-2,
 ) -> tuple[list[float], float]:
     """Per-delay memory capacity (washout-corrected)."""
+    targets = targets.to(states.device)
     if not torch.isfinite(states).all() or not torch.isfinite(targets).all():
         return [float("nan")] * max_delay, float("nan")
     if washout >= states.shape[0]:
@@ -455,6 +458,9 @@ def _jac_eigs_per_transition(
     so the CPU LAPACK backend does not fail on the linear reservoir's
     sometimes ill-conditioned per-sample Jacobians.
     """
+    # The state collector moves its local drive copy to the compute
+    # device, but the caller's sequence may still be CPU (CUDA run).
+    u_seq = u_seq.to(states_full.device)
     transitions = npr._select_transition_points(
         states_full, u_seq, washout=washout, n_samples=n_samples,
     )
@@ -886,14 +892,15 @@ def install_linear_reservoir_v2(
                 orig_b_forward is not None and u is not None
                 and stage._has_boundary and stage.boundary_src.numel() > 0
             ):
-                u_src = u[:, stage.boundary_src]
-                x_dst_b = x[:, stage.boundary_dst]
+                dev = x.device
+                u_src = u.to(dev)[:, stage.boundary_src.to(dev)]
+                x_dst_b = x[:, stage.boundary_dst.to(dev)]
                 i_b = orig_b_forward(
                     x_src=u_src, x_dst=x_dst_b, x_max=stage.x_max,
                 )
                 i_b = i_b * torch.sigmoid(stage.boundary_z_logits).unsqueeze(0)
                 acc_b = torch.zeros_like(acc, dtype=torch.float32)
-                acc_b.index_add_(1, stage.boundary_dst, i_b.float())
+                acc_b.index_add_(1, stage.boundary_dst.to(dev), i_b.float())
                 acc = (acc.float() + acc_b).to(dtype=acc.dtype)
         else:
             if u is not None and stage._has_boundary:
@@ -902,15 +909,17 @@ def install_linear_reservoir_v2(
                     b_src = getattr(stage, "_lin_injection_src", None)
                     b_dst = getattr(stage, "_lin_injection_dst", None)
                     if b_src is not None and b_dst is not None and G_in_t.numel() > 0:
-                        # Index tensors are plain CPU attributes (setattr
-                        # does not register buffers), so they must follow
-                        # the state/input device explicitly (CUDA run).
-                        b_src_d = b_src.to(u.device)
-                        b_dst_d = b_dst.to(x.device)
-                        u_src = u[:, b_src_d]
-                        i_b = G_in_t.to(u.device, u.dtype).unsqueeze(0) * u_src
+                        # All stored tensors are plain CPU attributes
+                        # (setattr does not register buffers) and the
+                        # caller may pass a CPU drive with a CUDA state,
+                        # so everything follows the state device here.
+                        dev = x.device
+                        u_src = u.to(dev)[:, b_src.to(dev)]
+                        i_b = (
+                            G_in_t.to(dev, x.dtype).unsqueeze(0) * u_src
+                        ).to(acc.dtype)
                         acc_b = torch.zeros_like(acc)
-                        acc_b.index_add_(1, b_dst_d, i_b)
+                        acc_b.index_add_(1, b_dst.to(dev), i_b)
                         acc = acc + acc_b
         # Leak.
         leak = stage._effective_leak(leak_floor=leak_floor).unsqueeze(0).to(x.device, x.dtype)
@@ -1046,6 +1055,7 @@ def _e0_ridge_on_state(
     states_full: torch.Tensor, y_seq: torch.Tensor, *,
     washout: int, l2: float = 1e-2,
 ) -> dict[str, float]:
+    y_seq = y_seq.to(states_full.device)
     X_w = states_full[washout:]
     y_w = y_seq[washout:]
     if X_w.shape[0] == 0:
@@ -1068,6 +1078,7 @@ def _legacy_hidden_only_ridge(
     states_full, hidden = _fabric_full_state_collect(
         net, u_seq, t_span=t_span, num_steps=num_steps, device=device,
     )
+    y_seq = y_seq.to(hidden.device)
     X_w = hidden[washout:]
     y_w = y_seq[washout:]
     if X_w.shape[0] == 0:
@@ -1101,6 +1112,8 @@ def r0_reconciliation(
     drive = ne._scale_drive(
         u_stream, bipolar=True, order=order, input_scale=CANONICAL_DRIVE_SCALE,
     )
+    drive = drive.to(device)
+    y_stream = y_stream.to(device)
 
     rows: list[RidgeRow] = []
     t0 = time.time()
@@ -1169,7 +1182,7 @@ def r0_reconciliation(
         )
         u_scaled = ne._scale_drive(
             u_stream, bipolar=True, order=order, input_scale=drive_scale,
-        )
+        ).to(device)
         states, _ = _fabric_full_state_collect(
             net, u_scaled, t_span=t_span, num_steps=num_steps, device=device,
         )
@@ -1189,8 +1202,8 @@ def r0_reconciliation(
     )
     long_u = ne._scale_drive(
         long_u_raw[0], bipolar=True, order=order, input_scale=CANONICAL_DRIVE_SCALE,
-    )
-    long_y = long_y_raw[0]
+    ).to(device)
+    long_y = long_y_raw[0].to(device)
     net = _build_canonical_fabric(
         order=order, seed=seed, refresh=0, freeze_read=False,
         hidden_dim=hidden_dim, t_span=t_span, num_steps=num_steps,
@@ -1254,9 +1267,14 @@ def r0_reconciliation(
 def _esn_collect_states(
     esn: ne.ESN, u_seq: torch.Tensor, *, device: str = "cpu",
 ) -> torch.Tensor:
-    """Run the ESN over a sequence and return ``(T, n_reservoir)`` states."""
-    states = esn._run(u_seq.to(device))
-    return states.detach()
+    """Run the ESN over a sequence and return ``(T, n_reservoir)`` states.
+
+    The ESN weights live on CPU (no ``.to()`` protocol), so the
+    recurrence always runs on CPU and the result is moved to ``device``
+    afterwards.
+    """
+    states = esn._run(u_seq.to("cpu"))
+    return states.detach().to(device)
 
 
 def _esn_jacobian_eigs(
@@ -1284,8 +1302,9 @@ def _esn_jacobian_eigs(
     indices = torch.linspace(
         washout, esn_states.shape[0] - 2, steps=n,
     ).round().to(torch.long).unique().tolist()
-    W = esn.W.detach().to(dtype=torch.float64)
-    W_in = esn.W_in.detach().to(dtype=torch.float64).squeeze(-1)
+    dev = esn_states.device
+    W = esn.W.detach().to(device=dev, dtype=torch.float64)
+    W_in = esn.W_in.detach().to(device=dev, dtype=torch.float64).squeeze(-1)
     leak = float(esn.leak)
     rows: list[dict[str, float]] = []
     eig_per_trans: list[list[float]] = []
@@ -1341,8 +1360,8 @@ def c0_esn_calibration(
         order=order, seed=seed, n_streams=n_streams,
         n=train_samples_per_stream,
     )
-    u_stream = u_raw[0]
-    y_stream = y_raw[0]
+    u_stream = u_raw[0].to(device)
+    y_stream = y_raw[0].to(device)
     esn = ne.ESN(
         n_reservoir=n_reservoir, spectral_radius=spectral_radius,
         input_scaling=input_scaling, leak=leak,
@@ -1434,6 +1453,10 @@ def c1_linear_reservoir(
     u_scaled = ne._scale_drive(
         u_stream, bipolar=True, order=order, input_scale=drive_scale,
     )
+    # Normalize stream devices up front: helpers move what they touch,
+    # but keeping one device throughout avoids any CPU/CUDA mixing.
+    u_scaled = u_scaled.to(device)
+    y_stream = y_stream.to(device)
     drive_rms = _drive_rms(u_scaled.to(torch.float32))
 
     net, ts, ns = ne._build_fabric_net(
@@ -1588,6 +1611,8 @@ def c2_c3_c4_bisection(
     u_scaled = ne._scale_drive(
         u_stream, bipolar=True, order=order, input_scale=drive_scale,
     )
+    u_scaled = u_scaled.to(device)
+    y_stream = y_stream.to(device)
     drive_rms = _drive_rms(u_scaled.to(torch.float32))
 
     legs: list[InstrumentRow] = []
