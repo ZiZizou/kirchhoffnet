@@ -794,6 +794,17 @@ def main() -> None:
     parser.add_argument("--ctle-earlystop-eval-every", type=int, default=5,
                         help="Evaluate CTLE common failure rate every N epochs "
                              "(default: 5; final epoch is always evaluated).")
+    parser.add_argument("--ctle-phase-a-validity-weight", type=float, default=0.3,
+                        help="Phase-A ZIG-validity NLL weight passed to every trial "
+                             "as --phase-a-validity-weight (default: 0.3; 0.0 = "
+                             "legacy Huber-only). Fixed trial constant, not a "
+                             "BO dimension.")
+    parser.add_argument("--ctle-phase-a-validity-ramp-start", type=int, default=10,
+                        help="Phase-A validity ramp start epoch, 1-based "
+                             "(default: 10).")
+    parser.add_argument("--ctle-phase-a-validity-ramp-epochs", type=int, default=30,
+                        help="Phase-A validity linear ramp length in epochs "
+                             "(default: 30, i.e. full weight from epoch 40).")
     parser.add_argument("--ctle-multifidelity",
                         action=argparse.BooleanOptionalAction, default=True,
                         help="Use successive-halving DAgger prefixes for CTLE "
@@ -1163,9 +1174,10 @@ def main() -> None:
             dagger_script = str((Path(__file__).parent / "dagger-nuance-distillation-kirchhoffnet.py").resolve())
             if args.ctle_phase_a:
                 # Canonical Phase-A mode (plan canonical-ctle-unify): static
-                # data, Huber-only, no DAgger.  The KNet student gets the full
-                # Friedman recipe (differential LR groups, gm/isat knobs) so
-                # the BO loop measures capacity + optimization in isolation.
+                # data, Huber + ramped ZIG-validity NLL, no DAgger.  The KNet
+                # student gets the full Friedman recipe (differential LR
+                # groups, gm/isat knobs) so the BO loop measures capacity +
+                # optimization in isolation.
                 if args.ctle_canonical_dataset is None:
                     raise ValueError(
                         "--ctle-phase-a requires --ctle-canonical-dataset <path> "
@@ -1193,6 +1205,9 @@ def main() -> None:
                     "--weight-decay", f"{weight_decay:.6e}",
                     "--batch-size", str(batch_size),
                     "--earlystop-eval-every", str(args.ctle_earlystop_eval_every),
+                    "--phase-a-validity-weight", f"{args.ctle_phase_a_validity_weight:.6f}",
+                    "--phase-a-validity-ramp-start", str(args.ctle_phase_a_validity_ramp_start),
+                    "--phase-a-validity-ramp-epochs", str(args.ctle_phase_a_validity_ramp_epochs),
                     "--output", str(trial_dir),
                     "--device", device,
                     "--seed", str(args.seed),
@@ -1676,6 +1691,9 @@ def main() -> None:
         f.write(f"invalid_param_objective: {args.invalid_param_objective}\n")
         f.write(f"param_reference: {param_reference}\n")
         f.write(f"seed: {args.seed}\n")
+        f.write(f"phase_a_validity_weight: {args.ctle_phase_a_validity_weight}\n")
+        f.write(f"phase_a_validity_ramp_start: {args.ctle_phase_a_validity_ramp_start}\n")
+        f.write(f"phase_a_validity_ramp_epochs: {args.ctle_phase_a_validity_ramp_epochs}\n")
         f.write(f"n_trials: {args.n_trials}\n")
         f.write(f"n_workers: {n_workers}\n")
         f.write(f"device: {device}\n")
@@ -1728,6 +1746,8 @@ def main() -> None:
             "normalized_param_count", "param_penalty",
             "invalid_param_objective",
             "penalized", "penalized_value", "penalty_reason",
+            "phase_a_validity_weight", "phase_a_validity_ramp_start",
+            "phase_a_validity_ramp_epochs",
         ])
         for t in study.trials:
             # New studies carry arch dims inside the joint tuple via
@@ -1777,6 +1797,9 @@ def main() -> None:
                 t.user_attrs.get("penalized", False),
                 t.user_attrs.get("penalized_value", ""),
                 t.user_attrs.get("penalty_reason", ""),
+                args.ctle_phase_a_validity_weight,
+                args.ctle_phase_a_validity_ramp_start,
+                args.ctle_phase_a_validity_ramp_epochs,
             ])
 
     _plot_history(

@@ -2186,7 +2186,9 @@ class StudentEvaluator:
                 pred_p.detach().cpu().numpy(), pred_j.detach().cpu().numpy(),
                 pred_h.detach().cpu().numpy(), pred_w.detach().cpu().numpy(),
             ], axis=1)
-            metric_dict = compute_forward_errors(pred_specs, val_specs)
+            metric_dict = compute_forward_errors(
+                pred_specs, val_specs, default_threshold=threshold,
+            )
             all_errors = np.stack([
                 metric_dict['err_p'], metric_dict['err_j'],
                 metric_dict['err_h'], metric_dict['err_w'],
@@ -2412,9 +2414,14 @@ def compute_forward_errors(pred_specs, target_specs,
                             default_threshold=None):
     if boundary_tols is None:
         boundary_tols = BOUNDARY_ABS_TOLERANCES
+    # Audit fix (phase-a validity bundle): default_threshold was accepted but
+    # never used — every caller silently got 0.20.  An explicitly passed
+    # threshold now governs the degrade gate; None preserves the legacy
+    # 0.20 default bit-identically for all existing callers.
     if default_threshold is None:
-        default_threshold = _active_ctx.get('ERROR_THRESHOLD', 0.10)
-    degrade_thr = _active_ctx.get('DEGRADE_REL_THRESHOLD', 0.20)
+        degrade_thr = _active_ctx.get('DEGRADE_REL_THRESHOLD', 0.20)
+    else:
+        degrade_thr = float(default_threshold)
     min_bad = _active_ctx.get('MIN_DEGRADED_DIMS', 2)
     pred_p = pred_specs[:, 0]; pred_j = pred_specs[:, 1]
     pred_h = pred_specs[:, 2]; pred_w = pred_specs[:, 3]
@@ -2621,6 +2628,41 @@ def _phase_a_loaders(canonical: dict, batch_size: int):
     return train_loader, val_loader, test_loader
 
 
+def _phase_a_validity_nll(student, logits, scaler_X, zig_model):
+    """Differentiable ZIG-validity NLL for Phase-A training: ``-log(p_valid)``.
+
+    Mirrors the student→ZIG path in :meth:`StudentEvaluator.identify_failures`
+    and :meth:`RegimeAwareLoss.forward` (sigmoid → bounded log-params →
+    ZIG scaling → frozen ZIG forward), but stays entirely in torch (no
+    detach/cpu/numpy) so gradients flow back into the student.  The ZIG
+    weights themselves are frozen (``requires_grad=False`` at load); only
+    the student receives gradients.
+
+    Returns a scalar tensor (mean NLL over the batch).  NLL (rather than the
+    linear ``1 - p_valid`` used by ``RegimeAwareLoss.L_invalid``) gives gradient
+    ``-1/p``: hardest push exactly where specs slide down the validity cliff
+    toward ``p -> 0``, relaxing once valid.
+    """
+    probs = torch.sigmoid(logits)
+    log_lo = student.log_lo.unsqueeze(0)
+    log_hi = student.log_hi.unsqueeze(0)
+    bounded_log = log_lo + (log_hi - log_lo) * probs
+    x_mean_t = torch.from_numpy(
+        scaler_X.mean_.astype(np.float32)
+    ).to(bounded_log.device)
+    x_scale_t = torch.from_numpy(
+        np.maximum(scaler_X.scale_, 1e-6).astype(np.float32)
+    ).to(bounded_log.device)
+    x_scaled = (bounded_log - x_mean_t) / (x_scale_t + 1e-8)
+    x_scaled = torch.clamp(x_scaled, -10.0, 10.0)
+    out = zig_model(x_scaled)
+    if 'p_valid' in out:
+        p_valid = out['p_valid'].clamp(1e-6, 1.0 - 1e-6)
+    else:
+        p_valid = (out['p_valid_h'] * out['p_valid_w'] * out['p_valid_j']).clamp(1e-6, 1.0 - 1e-6)
+    return (-torch.log(p_valid)).mean()
+
+
 def run_phase_a_training(student, ctx, *, model_name: str = "phase_a_student"):
     """Static, single-pass canonical-Phase-A training + ZIG evaluation.
 
@@ -2634,8 +2676,17 @@ def run_phase_a_training(student, ctx, *, model_name: str = "phase_a_student"):
       - grad_clip (float, default 1.0)
       - val_eval_every (int, default 1) — runs StudentEvaluator on the val split
         every N epochs; the best-failure checkpoint is the one carried forward.
-      - earlystop_patience (int, default 30)
+      - earlystop_patience (int, default 30) — counted in *eval cycles*
+        (only epochs that actually run the ZIG eval advance the counter).
       - error_threshold (float, default 0.10 — passes through to identify_failures)
+      - validity_weight (float, default 0.0) — weight on the ZIG-validity NLL
+        ``-log(p_valid)`` term.  0.0 reproduces the legacy Huber-only path
+        bit-identically (the ZIG forward is skipped entirely).
+      - validity_ramp_start (int, default 10) — first epoch (1-based) at which
+        the validity term starts fading in; earlier epochs are Huber-only so
+        the readout first fits the labels before validity is enforced.
+      - validity_ramp_epochs (int, default 30) — linear ramp length in epochs
+        from ramp start to full ``validity_weight``.
       - mapper_lr_scale / struct_lr_scale / dyn_lr_scale (floats) — KNet Friedman
         recipe; passed straight to the AdamW group builder.  If absent or 1.0
         the student is trained with a single AdamW group (safe for MLP).
@@ -2657,6 +2708,9 @@ def run_phase_a_training(student, ctx, *, model_name: str = "phase_a_student"):
     val_eval_every = int(ctx.get("val_eval_every", 1))
     earlystop_patience = int(ctx.get("earlystop_patience", 30))
     error_threshold = float(ctx.get("error_threshold", 0.10))
+    validity_weight = float(ctx.get("validity_weight", 0.0))
+    validity_ramp_start = int(ctx.get("validity_ramp_start", 10))
+    validity_ramp_epochs = int(ctx.get("validity_ramp_epochs", 30))
     mapper_lr_scale = float(ctx.get("mapper_lr_scale", 1.0))
     struct_lr_scale = float(ctx.get("struct_lr_scale", 1.0))
     dyn_lr_scale = float(ctx.get("dyn_lr_scale", 1.0))
@@ -2701,6 +2755,7 @@ def run_phase_a_training(student, ctx, *, model_name: str = "phase_a_student"):
     )
 
     history = {"epoch": [], "train_loss": [], "val_loss": [],
+               "train_valid_nll": [], "validity_w_eff": [],
                "val_failure_rate": [], "val_boundary_failure": [],
                "val_interior_failure": []}
     best_val_failure = float("inf")
@@ -2720,14 +2775,32 @@ def run_phase_a_training(student, ctx, *, model_name: str = "phase_a_student"):
 
     for epoch in range(epochs):
         student.train()
+        # Ramped validity weight (1-based epochs): 0 up to ramp start, linear
+        # ramp over ramp_epochs, full weight thereafter.  validity_weight=0.0
+        # keeps the legacy Huber-only path (ZIG forward skipped entirely).
+        if validity_weight > 0 and validity_ramp_epochs > 0:
+            ramp_frac = ((epoch + 1) - validity_ramp_start) / validity_ramp_epochs
+            w_eff = validity_weight * min(1.0, max(0.0, ramp_frac))
+        else:
+            w_eff = validity_weight
         total_loss = 0.0
+        total_huber = 0.0
+        total_valid_nll = 0.0
         n_batches = 0
         for specs_batch, params_target in train_loader:
             specs_batch = specs_batch.to(DEVICE)
             params_target = params_target.to(DEVICE)
             optimizer.zero_grad(set_to_none=True)
             logits = student(specs_batch)
-            loss = huber_loss(logits, params_target, delta=0.5).mean()
+            huber_term = huber_loss(logits, params_target, delta=0.5).mean()
+            if w_eff > 0:
+                valid_nll = _phase_a_validity_nll(
+                    student, logits, scaler_X, zig_model,
+                )
+                loss = huber_term + w_eff * valid_nll
+            else:
+                valid_nll = None
+                loss = huber_term
             if not torch.isfinite(loss):
                 _logger.warning(
                     f"[phaseA] non-finite loss at epoch {epoch+1}, batch {n_batches}; skipping"
@@ -2739,14 +2812,24 @@ def run_phase_a_training(student, ctx, *, model_name: str = "phase_a_student"):
                 torch.nn.utils.clip_grad_norm_(student.parameters(), grad_clip)
             optimizer.step()
             total_loss += loss.item()
+            total_huber += huber_term.item()
+            if valid_nll is not None:
+                total_valid_nll += valid_nll.item()
             n_batches += 1
         scheduler.step()
         avg_train = total_loss / max(1, n_batches)
+        avg_huber = total_huber / max(1, n_batches)
+        avg_valid_nll = total_valid_nll / max(1, n_batches) if w_eff > 0 else float("nan")
         avg_val = _phase_a_huber_eval(student, val_loader, DEVICE)
+        # ZIG failure eval runs only on eval epochs (or the final epoch).
+        # Patience is counted in *eval cycles*: non-eval epochs must not
+        # advance no_improve (previously they did via the nan placeholder,
+        # burning patience ~val_eval_every times too fast).
+        eval_this_epoch = (epoch + 1) % val_eval_every == 0 or epoch == epochs - 1
         val_failure_rate = float("nan")
         boundary_failure_rate = float("nan")
         interior_failure_rate = float("nan")
-        if (epoch + 1) % val_eval_every == 0 or epoch == epochs - 1:
+        if eval_this_epoch:
             evaluator.student = student
             val_specs = canonical["specs"][np.asarray(canonical["val_idx"], dtype=np.int64)]
             failure_mask, metrics = evaluator.identify_failures(
@@ -2761,8 +2844,16 @@ def run_phase_a_training(student, ctx, *, model_name: str = "phase_a_student"):
                 interior_failure_rate = float(
                     metrics["interior_failure"].sum() / max(1, (~bm).sum())
                 )
+            if val_failure_rate < best_val_failure:
+                best_val_failure = val_failure_rate
+                best_state = {k: v.detach().cpu().clone() for k, v in student.state_dict().items()}
+                no_improve = 0
+            else:
+                no_improve += 1
         history["epoch"].append(epoch + 1)
         history["train_loss"].append(avg_train)
+        history["train_valid_nll"].append(avg_valid_nll)
+        history["validity_w_eff"].append(w_eff)
         history["val_loss"].append(avg_val)
         history["val_failure_rate"].append(val_failure_rate)
         history["val_boundary_failure"].append(boundary_failure_rate)
@@ -2770,12 +2861,6 @@ def run_phase_a_training(student, ctx, *, model_name: str = "phase_a_student"):
         if avg_val < best_val_loss:
             best_val_loss = avg_val
             best_val_loss_state = {k: v.detach().cpu().clone() for k, v in student.state_dict().items()}
-        if not np.isnan(val_failure_rate) and val_failure_rate < best_val_failure:
-            best_val_failure = val_failure_rate
-            best_state = {k: v.detach().cpu().clone() for k, v in student.state_dict().items()}
-            no_improve = 0
-        else:
-            no_improve += 1
         torch.save(
             {"epoch": epoch, "model": student.state_dict(),
              "optimizer": optimizer.state_dict(), "history": history,
@@ -2783,12 +2868,19 @@ def run_phase_a_training(student, ctx, *, model_name: str = "phase_a_student"):
             checkpoint_path,
         )
         if (epoch + 1) % 10 == 0 or epoch == 0 or epoch == epochs - 1:
+            if eval_this_epoch:
+                fail_str = (
+                    f"val_fail={val_failure_rate*100:5.2f}% "
+                    f"(bnd={boundary_failure_rate*100:5.2f}% int={interior_failure_rate*100:5.2f}%) "
+                    f"best={best_val_failure*100:5.2f}%"
+                )
+            else:
+                fail_str = "val_fail=  --% (no ZIG eval this epoch)"
             _logger.info(
                 f"[phaseA] epoch {epoch+1:3d}/{epochs}  "
-                f"train_huber={avg_train:.4f}  val_huber={avg_val:.4f}  "
-                f"val_fail={val_failure_rate*100:5.2f}% "
-                f"(bnd={boundary_failure_rate*100:5.2f}% int={interior_failure_rate*100:5.2f}%) "
-                f"best={best_val_failure*100:5.2f}% patience={no_improve}/{earlystop_patience}"
+                f"train_huber={avg_huber:.4f}  valid_nll={avg_valid_nll:5.4f}  "
+                f"w_valid={w_eff:.3f}  val_huber={avg_val:.4f}  "
+                f"{fail_str} patience={no_improve}/{earlystop_patience}"
             )
         if earlystop_patience > 0 and no_improve >= earlystop_patience:
             _logger.info(
@@ -2837,6 +2929,12 @@ def run_phase_a_training(student, ctx, *, model_name: str = "phase_a_student"):
             "fingerprint": _canonical_fingerprint_str(canonical),
             "mapper_lr_scale": mapper_lr_scale, "struct_lr_scale": struct_lr_scale,
             "dyn_lr_scale": dyn_lr_scale,
+            "validity_weight": validity_weight,
+            "validity_ramp_start": validity_ramp_start,
+            "validity_ramp_epochs": validity_ramp_epochs,
+            "error_threshold": error_threshold,
+            "val_eval_every": val_eval_every,
+            "earlystop_patience": earlystop_patience,
         }}, handle, indent=2, default=str)
     _logger.info(f"[phaseA] wrote {log_path}")
     _logger.info(

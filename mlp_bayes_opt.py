@@ -67,6 +67,12 @@ def _recover_unfinished_trials(study: optuna.Study) -> tuple[list[dict[str, Any]
     Mirrors kn_bayes_opt.py:510 for AllianceCan Slurm preemptions. A trial
     stays RUNNING in SQLite if the allocation is killed; study.optimize will
     otherwise never retry it.
+
+    Seed trials carry no suggested params (the seed branch hardcodes its
+    config without suggest_* calls), so seed status is tracked separately in
+    the returned index set — callers must re-enqueue those with
+    ``recovered_seed_trial=True`` so the retry takes the seed branch instead
+    of sampling a random arch (parity with kn_bayes_opt).
     """
     running = [t for t in study.trials if t.state == optuna.trial.TrialState.RUNNING]
     if not running:
@@ -75,6 +81,8 @@ def _recover_unfinished_trials(study: optuna.Study) -> tuple[list[dict[str, Any]
     recovered_seed_indices: set[int] = set()
     for trial in running:
         params = dict(trial.params)
+        if trial.user_attrs.get("seed_trial") is True:
+            recovered_seed_indices.add(len(retry_params))
         retry_params.append(params)
         try:
             study._storage.set_trial_state_values(  # type: ignore[attr-defined]
@@ -378,6 +386,17 @@ def main() -> None:
     # which log line drives the value.
     parser.add_argument("--ctle-phase-a", action="store_true",
                         help="CTLE BO uses the canonical Phase-A training mode (static data, Huber-only).")
+    parser.add_argument("--ctle-phase-a-validity-weight", type=float, default=0.3,
+                        help="Phase-A ZIG-validity NLL weight passed to every trial "
+                             "as --phase-a-validity-weight (default: 0.3; 0.0 = "
+                             "legacy Huber-only). Fixed trial constant, not a "
+                             "BO dimension. Must match kn_bayes_opt for comparability.")
+    parser.add_argument("--ctle-phase-a-validity-ramp-start", type=int, default=10,
+                        help="Phase-A validity ramp start epoch, 1-based "
+                             "(default: 10).")
+    parser.add_argument("--ctle-phase-a-validity-ramp-epochs", type=int, default=30,
+                        help="Phase-A validity linear ramp length in epochs "
+                             "(default: 30, i.e. full weight from epoch 40).")
     parser.add_argument("--ctle-canonical-dataset", type=Path, default=None,
                         help="Path to the shared canonical Phase-A .npz; required when "
                              "--ctle-phase-a is set so every trial sees the same labels.")
@@ -455,11 +474,17 @@ def main() -> None:
         study = optuna.load_study(study_name=study_name, storage=storage,
                                   sampler=sampler)
         bps.check_sampling_fingerprint(study, sampling_fingerprint)
-        retry_params, _ = _recover_unfinished_trials(study)
+        retry_params, recovered_seed_indices = _recover_unfinished_trials(study)
         if retry_params:
             print(f"[mlp_bayes_opt] recovered {len(retry_params)} unfinished trial(s); they will be retried")
-            for params in retry_params:
-                study.enqueue_trial(params)
+            for retry_index, params in enumerate(retry_params):
+                study.enqueue_trial(
+                    params,
+                    user_attrs={
+                        "recovered_trial": True,
+                        "recovered_seed_trial": retry_index in recovered_seed_indices,
+                    },
+                )
     else:
         study = optuna.create_study(study_name=study_name, storage=storage,
                                     sampler=sampler, direction="minimize")
@@ -475,7 +500,10 @@ def main() -> None:
         )
         seed_waiting = any(
             t.state == optuna.trial.TrialState.WAITING
-            and t.user_attrs.get("seed_trial") is True
+            and (
+                t.user_attrs.get("seed_trial") is True
+                or t.user_attrs.get("recovered_seed_trial") is True
+            )
             for t in study.trials
         )
         if not seed_complete and not seed_waiting:
@@ -556,7 +584,12 @@ def main() -> None:
         # ── CTLE fast DAgger proxy (4×100, Test 1000) ───────────────────
         if args.dataset == "ctle":
             # Use current defaults as trial 0 seed; otherwise sample MoE + DAgger knobs.
-            is_seed = trial.user_attrs.get("seed_trial") is True
+            # Recovered seed retries (re-enqueued after preemption) take the
+            # seed branch too — parity with kn_bayes_opt.
+            is_seed = (
+                trial.user_attrs.get("seed_trial") is True
+                or trial.user_attrs.get("recovered_seed_trial") is True
+            )
             soft_limit = int(param_budget * (1.0 + args.param_tolerance))
             if is_seed:
                 trunk_width = 44
@@ -593,10 +626,11 @@ def main() -> None:
                                     f"expected params={expected_params} > soft cap {soft_limit}")
                 return _over_budget_objective(
                     expected_params, soft_limit, args.invalid_param_objective)
-            # Phase-A mode (plan canonical-ctle-unify): static data, Huber-only,
-            # bypass DAgger, shared canonical .npz.  Validation failure is the
-            # default objective; --ctle-objective test re-enables the test metric
-            # for direct comparability with the legacy DAgger logs.
+            # Phase-A mode (plan canonical-ctle-unify): static data, Huber +
+            # ramped ZIG-validity NLL, bypass DAgger, shared canonical .npz.
+            # Validation failure is the default objective; --ctle-objective
+            # test re-enables the test metric for direct comparability with
+            # the legacy DAgger logs.
             if args.ctle_phase_a:
                 if args.ctle_canonical_dataset is None:
                     raise ValueError(
@@ -614,6 +648,9 @@ def main() -> None:
                     "--weight-decay", f"{weight_decay:.6e}",
                     "--batch-size", str(batch_size),
                     "--earlystop-eval-every", str(args.ctle_earlystop_eval_every),
+                    "--phase-a-validity-weight", f"{args.ctle_phase_a_validity_weight:.6f}",
+                    "--phase-a-validity-ramp-start", str(args.ctle_phase_a_validity_ramp_start),
+                    "--phase-a-validity-ramp-epochs", str(args.ctle_phase_a_validity_ramp_epochs),
                     "--output", str(trial_dir),
                     "--device", device,
                     "--seed", str(args.seed),
@@ -810,6 +847,9 @@ def main() -> None:
         f.write(f"objective: {args.objective}\n")
         f.write(f"param_penalty: {args.param_penalty}\n")
         f.write(f"seed: {args.seed}\n")
+        f.write(f"phase_a_validity_weight: {args.ctle_phase_a_validity_weight}\n")
+        f.write(f"phase_a_validity_ramp_start: {args.ctle_phase_a_validity_ramp_start}\n")
+        f.write(f"phase_a_validity_ramp_epochs: {args.ctle_phase_a_validity_ramp_epochs}\n")
         f.write(f"n_trials: {args.n_trials}\n")
         f.write(f"n_workers: {n_workers}\n")
         f.write(f"device: {device}\n")
@@ -843,6 +883,8 @@ def main() -> None:
             "best_mape_orig", "final_val", "elapsed_seconds",
             "raw_objective", "normalized_param_count", "param_penalty",
             "penalized", "penalized_value", "penalty_reason",
+            "phase_a_validity_weight", "phase_a_validity_ramp_start",
+            "phase_a_validity_ramp_epochs",
         ])
         for t in study.trials:
             actual_params = t.user_attrs.get("actual_params", -1)
@@ -872,6 +914,9 @@ def main() -> None:
                 t.user_attrs.get("penalized", False),
                 t.user_attrs.get("penalized_value", ""),
                 t.user_attrs.get("penalty_reason", ""),
+                args.ctle_phase_a_validity_weight,
+                args.ctle_phase_a_validity_ramp_start,
+                args.ctle_phase_a_validity_ramp_epochs,
             ])
 
     _plot_history(

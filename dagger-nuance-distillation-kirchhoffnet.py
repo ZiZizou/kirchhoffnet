@@ -707,6 +707,16 @@ try:
                             help='Boundary ratio used when preparing the canonical dataset (default 0.5).')
     _bo_parser.add_argument('--phase-a-n-samples', type=int, default=20000,
                             help='Number of specs in the canonical dataset (default 20000).')
+    _bo_parser.add_argument('--phase-a-validity-weight', type=float, default=0.0,
+                            help='Weight on the ZIG-validity NLL -log(p_valid) term added to '
+                                 'the Huber loss in Phase-A training (default 0.0 = legacy '
+                                 'Huber-only). BO drivers pass 0.3.')
+    _bo_parser.add_argument('--phase-a-validity-ramp-start', type=int, default=10,
+                            help='First epoch (1-based) at which the validity term starts '
+                                 'fading in (default 10).')
+    _bo_parser.add_argument('--phase-a-validity-ramp-epochs', type=int, default=30,
+                            help='Linear ramp length in epochs to full validity weight '
+                                 '(default 30, i.e. full weight from epoch 40).')
     # KNet Friedman recipe (differential LR groups + cell bounds).  All are
     # no-ops when left at their default — single AdamW group with the base LR
     # is used, matching the previous MLP/Plain student behavior.
@@ -3147,6 +3157,9 @@ if _bo_args.prepare_canonical_dataset is not None or _bo_args.canonical_dataset 
                                    else EARLYSTOP_EVAL_EVERY),
             "earlystop_patience": int(EARLYSTOP_PATIENCE_EPOCHS),
             "error_threshold": ERROR_THRESHOLD,
+            "validity_weight": float(_bo_args.phase_a_validity_weight),
+            "validity_ramp_start": int(_bo_args.phase_a_validity_ramp_start),
+            "validity_ramp_epochs": int(_bo_args.phase_a_validity_ramp_epochs),
             "input_preprocessing": "knet",
             "mapper_lr_scale": float(_bo_args.kn_mapper_lr_scale),
             "struct_lr_scale": float(_bo_args.kn_struct_lr_scale),
@@ -3156,7 +3169,9 @@ if _bo_args.prepare_canonical_dataset is not None or _bo_args.canonical_dataset 
                      f"epochs={phase_a_epochs}, batch={ctx_phase_a['batch_size']}, "
                      f"lr={ctx_phase_a['lr']:.2e}, "
                      f"diff-LR scales mapper/struct/dyn="
-                     f"{_bo_args.kn_mapper_lr_scale}/{_bo_args.kn_struct_lr_scale}/{_bo_args.kn_dyn_lr_scale}")
+                     f"{_bo_args.kn_mapper_lr_scale}/{_bo_args.kn_struct_lr_scale}/{_bo_args.kn_dyn_lr_scale}, "
+                     f"validity_w={ctx_phase_a['validity_weight']:.3f} "
+                     f"ramp=[{ctx_phase_a['validity_ramp_start']}+{ctx_phase_a['validity_ramp_epochs']}]")
         run_phase_a_training(student, ctx_phase_a, model_name="phase_a_knet")
         _logger.info("[phaseA] canonical-dataset gate: training complete; exiting before DAgger body")
         sys.exit(0)

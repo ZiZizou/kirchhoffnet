@@ -98,6 +98,16 @@ def parse_args():
                         help="Boundary ratio used when preparing the canonical dataset.")
     parser.add_argument("--phase-a-n-samples", type=int, default=20000,
                         help="Number of specs in the canonical dataset.")
+    parser.add_argument("--phase-a-validity-weight", type=float, default=0.0,
+                        help="Weight on the ZIG-validity NLL -log(p_valid) term added to "
+                             "the Huber loss in Phase-A training (default 0.0 = legacy "
+                             "Huber-only). BO drivers pass 0.3.")
+    parser.add_argument("--phase-a-validity-ramp-start", type=int, default=10,
+                        help="First epoch (1-based) at which the validity term starts "
+                             "fading in (default 10).")
+    parser.add_argument("--phase-a-validity-ramp-epochs", type=int, default=30,
+                        help="Linear ramp length in epochs to full validity weight "
+                             "(default 30, i.e. full weight from epoch 40).")
     return parser.parse_args()
 
 
@@ -267,6 +277,9 @@ def main():
                 "val_eval_every": int(args.earlystop_eval_every or 1),
                 "earlystop_patience": 30,
                 "error_threshold": 0.10,
+                "validity_weight": float(args.phase_a_validity_weight),
+                "validity_ramp_start": int(args.phase_a_validity_ramp_start),
+                "validity_ramp_epochs": int(args.phase_a_validity_ramp_epochs),
                 "input_preprocessing": args.input_preprocessing,
                 "input_log_min": getattr(student, "input_log_min", None),
                 "input_log_max": getattr(student, "input_log_max", None),
