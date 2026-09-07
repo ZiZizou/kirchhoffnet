@@ -1311,6 +1311,10 @@ def main() -> None:
                 trial.set_user_attr("phase_a_test_failure_rate", test_value)
                 trial.set_user_attr("test_failure_rate", test_value)
                 trial.set_user_attr("validation_failure_rate", val_value)
+                # Bind the shared tail variables: the common return path
+                # below reads test_rate/validation_rate/param_count/base_metric.
+                test_rate = test_value
+                validation_rate = val_value
                 param_count = preflight_params
                 base_metric = objective_value
                 print(f"[ctle] trial {trial.number} phaseA {args.ctle_objective} "
