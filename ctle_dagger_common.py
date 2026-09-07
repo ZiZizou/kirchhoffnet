@@ -1829,7 +1829,10 @@ def _predict_forward_power(params_arr: np.ndarray) -> np.ndarray:
 def _canonical_dataset_fingerprint(seed: int, teacher_identity: str,
                                   n_samples: int, boundary_ratio: float,
                                   top_k: int, valid_threshold: float,
-                                  relaxed_threshold: float, tie_break: str) -> str:
+                                  relaxed_threshold: float, tie_break: str,
+                                  mlp_teacher_id: str | None = None,
+                                  power_norm: str | None = None,
+                                  schema_rev: int = 1) -> str:
     payload = {
         "seed": int(seed),
         "teacher_identity": str(teacher_identity),
@@ -1841,9 +1844,28 @@ def _canonical_dataset_fingerprint(seed: int, teacher_identity: str,
         "tie_break": str(tie_break),
         "feature_order": list(_PHASE_A_FEATURE_ORDER),
     }
+    # Plan phase-a-mlp-guided-knet (schema_rev=2): the MLP-guided loss pins
+    # the frozen MLP teacher identity and the power normalisation.
+    # Audit fix: the new keys are appended ONLY for schema_rev >= 2 so a
+    # legacy schema-1 rebuild hashes exactly as before (previously the added
+    # None-valued keys changed the legacy hash, breaking the "keep the old
+    # hash" claim and any out-of-tree fingerprint comparisons).
+    if int(schema_rev) >= 2 or mlp_teacher_id is not None or power_norm is not None:
+        payload["mlp_teacher_id"] = None if mlp_teacher_id is None else str(mlp_teacher_id)
+        payload["power_norm"] = None if power_norm is None else str(power_norm)
+        payload["schema_rev"] = int(schema_rev)
     return hashlib.sha256(
         json.dumps(payload, sort_keys=True).encode("utf-8")
     ).hexdigest()
+
+
+def _file_sha256(path: str | os.PathLike) -> str:
+    """sha256 hex digest of a file's bytes (pins the MLP teacher checkpoint)."""
+    h = hashlib.sha256()
+    with open(path, "rb") as fh:
+        for chunk in iter(lambda: fh.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
 
 
 def create_canonical_flow_dataset(
@@ -1860,6 +1882,13 @@ def create_canonical_flow_dataset(
     zig_model=None,
     scaler_X=None,
     device=None,
+    mlp_teacher=None,
+    mlp_teacher_id: str | None = None,
+    power_norm: str = "train_mean",
+    # Audit fix: default schema_rev=1 (legacy). The mlp_teacher branch below
+    # bumps to >= 2, so non-teacher callers (MoE / plain-MLP harnesses) can
+    # never accidentally stamp a schema-2 revision on a teacher-less build.
+    schema_rev: int = 1,
 ):
     """Canonical Phase-A dataset: flow-labelled, min-power tie-break, frozen.
 
@@ -1946,6 +1975,15 @@ def create_canonical_flow_dataset(
     )
 
     teacher_identity = str(getattr(teacher_labeler, "teacher_dir", DEFAULT_TEACHER_DIR))
+    # Plan phase-a-mlp-guided-knet (schema_rev=2): append the frozen MLP
+    # teacher logits + power columns when a teacher is supplied. The
+    # fingerprint payload pins mlp_teacher_id + power_norm + schema_rev so a
+    # schema-1 dataset can never resume a schema-2 study (and vice versa).
+    if mlp_teacher is not None:
+        mlp_teacher_id = mlp_teacher_id or "mlp_teacher"
+        schema_rev = max(2, int(schema_rev))
+    else:
+        schema_rev = int(min(schema_rev, 1))
     fingerprint = _canonical_dataset_fingerprint(
         seed=seed,
         teacher_identity=teacher_identity,
@@ -1955,6 +1993,9 @@ def create_canonical_flow_dataset(
         valid_threshold=valid_threshold,
         relaxed_threshold=relaxed_threshold,
         tie_break=PHASE_A_TIE_BREAK,
+        mlp_teacher_id=mlp_teacher_id,
+        power_norm=power_norm if mlp_teacher is not None else None,
+        schema_rev=schema_rev,
     )
 
     rng = np.random.default_rng(seed)
@@ -1971,10 +2012,18 @@ def create_canonical_flow_dataset(
     spec_logs = np.log10(np.clip(specs_arr, 1e-12, None))
     lo, hi = spec_logs.min(axis=0), spec_logs.max(axis=0)
     pad = 0.05 * np.maximum(hi - lo, 1e-8)
+    # Plan phase-a-mlp-guided-knet: audit columns. ``flow_label_power`` is
+    # 4*VDD*I of the chosen flow label (physical units); ``mlp_label_power``
+    # is 4*VDD*I of the MLP teacher's decoded label. ``power_norm_const`` is
+    # the train-mean normaliser consumed by the absolute-power loss term.
+    flow_label_power = (4.0 * np.clip(chosen[:, 6], 0, None)
+                        * np.clip(chosen[:, 1], 0, None)).astype(np.float32)
     payload = {
         "specs": specs_arr.astype(np.float32),
         "params": chosen.astype(np.float32),
         "predicted_power": predicted_power.astype(np.float32),
+        "flow_label_power": flow_label_power,
+        "schema_rev": np.array(int(schema_rev)),
         "fingerprint": np.array(fingerprint),
         "train_idx": train_idx.astype(np.int64),
         "val_idx": val_idx.astype(np.int64),
@@ -1983,6 +2032,27 @@ def create_canonical_flow_dataset(
         "input_log_min": (lo - pad).astype(np.float32),
         "input_log_max": (hi + pad).astype(np.float32),
     }
+    if mlp_teacher is not None:
+        mlp_teacher.eval()
+        with torch.no_grad():
+            specs_t = torch.from_numpy(specs_arr.astype(np.float32)).to(next(mlp_teacher.parameters()).device)
+            mlp_logits = mlp_teacher(specs_t).detach().cpu().numpy().astype(np.float32)
+        bounded_log = mlp_teacher.log_lo.unsqueeze(0) + (
+            mlp_teacher.log_hi - mlp_teacher.log_lo
+        ) * torch.sigmoid(torch.from_numpy(mlp_logits).to(mlp_teacher.log_lo.device))
+        bounded_log = bounded_log.cpu().numpy()
+        mlp_label_power = (4.0 * np.power(10.0, bounded_log[:, 6])
+                           * np.power(10.0, bounded_log[:, 1])).astype(np.float32)
+        train_mask = np.zeros(len(specs_arr), dtype=bool)
+        train_mask[train_idx] = True
+        power_norm_const = float(mlp_label_power[train_mask].mean())
+        payload["mlp_logits_trial0019"] = mlp_logits
+        payload["mlp_label_power"] = mlp_label_power
+        payload["power_norm_const"] = np.array(power_norm_const, dtype=np.float64)
+        _logger.info(
+            f"[phaseA] MLP teacher logits appended (id={mlp_teacher_id}); "
+            f"train-mean power={power_norm_const:.6g} (power_norm={power_norm}, schema_rev={schema_rev})"
+        )
     if output_path is not None:
         out = Path(output_path)
         out.parent.mkdir(parents=True, exist_ok=True)
@@ -1993,7 +2063,13 @@ def create_canonical_flow_dataset(
 
 
 def load_canonical_flow_dataset(path: str | os.PathLike) -> dict:
-    """Load a canonical Phase-A .npz produced by :func:`create_canonical_flow_dataset`."""
+    """Load a canonical Phase-A .npz produced by :func:`create_canonical_flow_dataset`.
+
+    The returned dict carries ``schema_rev`` (int; 1 = legacy Huber-only
+    build, 2 = MLP-guided build with ``mlp_logits_trial0019``). Optional
+    schema-2 fields are only present when the build was made with an MLP
+    teacher.
+    """
     p = Path(path)
     if not p.is_file():
         raise FileNotFoundError(f"Canonical dataset not found: {p}")
@@ -2004,7 +2080,9 @@ def load_canonical_flow_dataset(path: str | os.PathLike) -> dict:
     missing = required - set(npz.files)
     if missing:
         raise RuntimeError(f"Canonical dataset {p} missing fields: {sorted(missing)}")
-    return {key: npz[key] for key in npz.files}
+    out = {key: npz[key] for key in npz.files}
+    out.setdefault("schema_rev", np.array(1))
+    return out
 
 
 def create_blended_distillation_dataset(df, teacher_labeler=None, n_samples=5000, n_candidates=5000,
@@ -2584,7 +2662,14 @@ def train_epoch(student, train_loader, optimizer, criterion, device, loss_weight
 # Spec: docs/specs/canonical-ctle-bench.md + docs/specs/canonical-phasea-run.md.
 
 class _PhaseACanonicalDataset(Dataset):
-    """Static loader for the canonical Phase-A .npz (specs + flow labels)."""
+    """Static loader for the canonical Phase-A .npz (specs + flow labels).
+
+    Schema-2 builds additionally carry ``mlp_logits_trial0019``; when present,
+    ``__getitem__`` returns ``(specs, params_log, mlp_logits)`` with
+    ``mlp_logits`` zero-filled for schema-1 datasets (callers gate the MLP
+    term on the loss weights, so the zeros are never consumed by the legacy
+    path).
+    """
 
     MAX_PARAMS = 7
 
@@ -2596,6 +2681,12 @@ class _PhaseACanonicalDataset(Dataset):
         if pad > 0:
             params_log = np.pad(params_log, ((0, 0), (0, pad)), constant_values=-30.0)
         self.params_log = params_log.astype(np.float32)
+        if "mlp_logits_trial0019" in canonical:
+            self.mlp_logits = np.asarray(
+                canonical["mlp_logits_trial0019"], dtype=np.float32)
+        else:
+            self.mlp_logits = np.zeros((len(self.specs), self.MAX_PARAMS),
+                                       dtype=np.float32)
         idx = canonical[f"{split}_idx"]
         self.indices = np.asarray(idx, dtype=np.int64).tolist()
 
@@ -2606,7 +2697,8 @@ class _PhaseACanonicalDataset(Dataset):
         j = self.indices[idx]
         specs = torch.from_numpy(self.specs[j])
         params = torch.from_numpy(self.params_log[j])
-        return specs, params
+        mlp_logits = torch.from_numpy(self.mlp_logits[j])
+        return specs, params, mlp_logits
 
 
 def _phase_a_loaders(canonical: dict, batch_size: int):
@@ -2663,6 +2755,73 @@ def _phase_a_validity_nll(student, logits, scaler_X, zig_model):
     return (-torch.log(p_valid)).mean()
 
 
+def _phase_a_decode_and_forward(student, logits, scaler_X, scaler_y_p, zig_model):
+    """Decode student logits exactly like ``StudentEvaluator`` and run the ZIG.
+
+    Returns ``(pred_p, pred_j, pred_h, pred_w, x_scaled)`` as torch tensors in
+    physical units (power via the log-space ``scaler_y_p`` decode), so the
+    train-time forward physics is identical to eval time.
+    """
+    probs = torch.sigmoid(logits)
+    log_lo = student.log_lo.unsqueeze(0)
+    log_hi = student.log_hi.unsqueeze(0)
+    bounded_log = log_lo + (log_hi - log_lo) * probs
+    x_mean_t = torch.from_numpy(scaler_X.mean_.astype(np.float32)).to(bounded_log.device)
+    x_scale_t = torch.from_numpy(
+        np.maximum(scaler_X.scale_, 1e-6).astype(np.float32)
+    ).to(bounded_log.device)
+    x_scaled = (bounded_log - x_mean_t) / (x_scale_t + 1e-8)
+    x_scaled = torch.clamp(x_scaled, -10.0, 10.0)
+    out = zig_model(x_scaled)
+    pred_h = out['pred_h_soft'].clamp(min=1e-12, max=1e12)
+    pred_w = out['pred_w_soft'].clamp(min=1e-12, max=1e12)
+    pred_j = out['pred_j_soft'].clamp(min=1e-12, max=1e12)
+    power_scaled = out['mu_power'] * float(scaler_y_p.scale_[0]) + float(scaler_y_p.mean_[0])
+    pred_p = torch.clamp(10.0 ** power_scaled, 1e-12, 1e12)
+    return pred_p, pred_j, pred_h, pred_w, bounded_log
+
+
+def _phase_a_student_power(bounded_log):
+    """Absolute surrogate power ``4*VDD*I`` (physical W) from decoded log-params.
+
+    PARAM_COLS order: fW(0), current(1), ind(2), Rd(3), Cs(4), Rs(5), VDD(6);
+    ``bounded_log`` entries are log10 values, so the product is fully
+    differentiable in the logits.
+    """
+    return 4.0 * torch.pow(10.0, bounded_log[:, 6]) * torch.pow(10.0, bounded_log[:, 1])
+
+
+def _phase_a_split_power_and_mse(student, specs_arr, mlp_logits_arr,
+                                 scaler_y_p, device, batch_size: int = 1024):
+    """No-grad per-spec absolute power and MLP-logit MSE for a split.
+
+    Chunked in ``batch_size`` blocks: the train split holds 16k specs and a
+    single KNet ODE forward over the whole split risks GPU OOM.
+    """
+    student.eval()
+    specs_np = np.asarray(specs_arr, dtype=np.float32)
+    mlp_np = (np.asarray(mlp_logits_arr, dtype=np.float32)
+              if mlp_logits_arr is not None else None)
+    powers: list[np.ndarray] = []
+    se_sum = 0.0
+    se_count = 0
+    with torch.no_grad():
+        for start in range(0, len(specs_np), max(1, int(batch_size))):
+            chunk = torch.from_numpy(specs_np[start:start + batch_size]).to(device)
+            logits = student(chunk)
+            probs = torch.sigmoid(logits)
+            bounded_log = student.log_lo.unsqueeze(0) + (
+                student.log_hi - student.log_lo) * probs
+            powers.append(_phase_a_student_power(bounded_log).cpu().numpy())
+            if mlp_np is not None:
+                target = torch.from_numpy(mlp_np[start:start + batch_size]).to(device)
+                se_sum += float(torch.sum((logits - target) ** 2).item())
+                se_count += int(logits.numel())
+    power = np.concatenate(powers) if powers else np.zeros(0, dtype=np.float64)
+    mse = float(se_sum / max(1, se_count)) if mlp_np is not None else float("nan")
+    return power.astype(np.float64), mse
+
+
 def run_phase_a_training(student, ctx, *, model_name: str = "phase_a_student"):
     """Static, single-pass canonical-Phase-A training + ZIG evaluation.
 
@@ -2690,6 +2849,18 @@ def run_phase_a_training(student, ctx, *, model_name: str = "phase_a_student"):
       - mapper_lr_scale / struct_lr_scale / dyn_lr_scale (floats) — KNet Friedman
         recipe; passed straight to the AdamW group builder.  If absent or 1.0
         the student is trained with a single AdamW group (safe for MLP).
+      - mlp_weight (float, default 0.0) — weight on MSE(student_logits,
+        canonical ``mlp_logits_trial0019``).  Requires a schema_rev >= 2
+        canonical dataset; 0.0 keeps the legacy Huber-on-flow path.
+      - fwd_weight (float, default 0.0) — weight on the ZIG forward-consistency
+        MSE in scaled spec space (same scaling as ``StudentEvaluator``).
+      - power_weight (float, default 0.0) — weight on the normalised absolute
+        power term ``mean(4*VDD*I) / power_norm_const`` (physical watts from
+        the decoded logits; NOT a gap-to-label).
+      - power_norm_const (float, default None) — explicit override of the
+        train-mean power normaliser; falls back to the canonical dataset's
+        ``power_norm_const``.  Required (finite, positive) when
+        ``power_weight > 0``; falls back to 1.0 (unnormalised) otherwise.
     """
     DEVICE = ctx["DEVICE"]
     scaler_X = ctx["scaler_X"]
@@ -2711,6 +2882,40 @@ def run_phase_a_training(student, ctx, *, model_name: str = "phase_a_student"):
     validity_weight = float(ctx.get("validity_weight", 0.0))
     validity_ramp_start = int(ctx.get("validity_ramp_start", 10))
     validity_ramp_epochs = int(ctx.get("validity_ramp_epochs", 30))
+    # Plan phase-a-mlp-guided-knet: 4-term loss weights. All default to 0.0 so
+    # a legacy ctx reproduces the Huber-only path bit-identically.
+    mlp_weight = float(ctx.get("mlp_weight", 0.0))
+    fwd_weight = float(ctx.get("fwd_weight", 0.0))
+    power_weight = float(ctx.get("power_weight", 0.0))
+    power_norm_const = ctx.get("power_norm_const", None)
+    if power_norm_const is not None:
+        power_norm_const = float(power_norm_const)
+    elif "power_norm_const" in canonical:
+        power_norm_const = float(np.asarray(canonical["power_norm_const"]).item())
+    schema_rev = int(np.asarray(canonical.get("schema_rev", np.array(1))).item())
+    mlp_guided = (mlp_weight > 0 or fwd_weight > 0 or power_weight > 0)
+    if mlp_guided:
+        if schema_rev < 2 or "mlp_logits_trial0019" not in canonical:
+            raise RuntimeError(
+                "[phaseA] MLP-guided loss requested (mlp/fwd/power weight > 0) but the "
+                f"canonical dataset is schema_rev={schema_rev} without "
+                "'mlp_logits_trial0019'. Old schema-1 datasets cannot be resumed by a "
+                "schema-2 study; rebuild with --prepare-canonical-dataset and an "
+                "--phase-a-mlp-teacher-ckpt (plan phase-a-mlp-guided-knet)."
+            )
+        if power_weight > 0 and (power_norm_const is None or not np.isfinite(power_norm_const)
+                                 or power_norm_const <= 0):
+            raise RuntimeError(
+                "[phaseA] power_weight > 0 requires a finite positive power_norm_const "
+                "(train-mean power); the dataset was built without it."
+            )
+        # Audit fix: guided runs that only use mlp/fwd weights (power_weight=0)
+        # still compute + log the power term, but must not crash on a missing
+        # constant (e.g. hand-built test dicts). Fall back to 1.0 so the logged
+        # power is unnormalised absolute watts; the loss term is multiplied by
+        # power_weight=0 anyway.
+        if power_norm_const is None or not np.isfinite(power_norm_const) or power_norm_const <= 0:
+            power_norm_const = 1.0
     mapper_lr_scale = float(ctx.get("mapper_lr_scale", 1.0))
     struct_lr_scale = float(ctx.get("struct_lr_scale", 1.0))
     dyn_lr_scale = float(ctx.get("dyn_lr_scale", 1.0))
@@ -2757,7 +2962,18 @@ def run_phase_a_training(student, ctx, *, model_name: str = "phase_a_student"):
     history = {"epoch": [], "train_loss": [], "val_loss": [],
                "train_valid_nll": [], "validity_w_eff": [],
                "val_failure_rate": [], "val_boundary_failure": [],
-               "val_interior_failure": []}
+               "val_interior_failure": [],
+               # Plan phase-a-mlp-guided-knet: per-term instrumentation.
+               "mlp_mse": [], "fwd_mse": [], "train_nll": [],
+               "train_power": [], "train_power_norm": [],
+               "loss_weights": [], "val_invalid_rate": [],
+               "val_degrade_rate": [], "val_valid_mean_power": []}
+    if mlp_guided:
+        _logger.info(
+            f"[phaseA] MLP-guided loss enabled: mlp_w={mlp_weight} fwd_w={fwd_weight} "
+            f"power_w={power_weight} validity_w={validity_weight} "
+            f"power_norm_const={power_norm_const:.6g} schema_rev={schema_rev}"
+        )
     best_val_failure = float("inf")
     best_state = None
     best_val_loss = float("inf")
@@ -2786,21 +3002,89 @@ def run_phase_a_training(student, ctx, *, model_name: str = "phase_a_student"):
         total_loss = 0.0
         total_huber = 0.0
         total_valid_nll = 0.0
+        total_mlp_mse = 0.0
+        total_fwd_mse = 0.0
+        total_power = 0.0
         n_batches = 0
-        for specs_batch, params_target in train_loader:
+        first_batch_ratios = None
+        for specs_batch, params_target, mlp_logits_target in train_loader:
             specs_batch = specs_batch.to(DEVICE)
             params_target = params_target.to(DEVICE)
+            # Audit fix: the schema-2 logits column loads on CPU; without this
+            # the guided MSE raises a device-mismatch error on CUDA trials.
+            mlp_logits_target = mlp_logits_target.to(DEVICE)
             optimizer.zero_grad(set_to_none=True)
             logits = student(specs_batch)
-            huber_term = huber_loss(logits, params_target, delta=0.5).mean()
-            if w_eff > 0:
-                valid_nll = _phase_a_validity_nll(
-                    student, logits, scaler_X, zig_model,
+            if mlp_guided:
+                # Plan phase-a-mlp-guided-knet 4-term loss. ``mse_mlp`` on raw
+                # teacher/student logits (stable anchor); ``fwd_mse`` on scaled
+                # spec space (eye scales for j/h/w, scaler_y_p for power);
+                # ``nll`` dimensionless; ``power_norm`` absolute 4*VDD*I in
+                # physical W divided by the train-mean power.
+                mse_mlp = torch.mean((logits - mlp_logits_target) ** 2)
+                pred_p, pred_j, pred_h, pred_w, bounded_log = _phase_a_decode_and_forward(
+                    student, logits, scaler_X, scaler_y_p, zig_model,
                 )
-                loss = huber_term + w_eff * valid_nll
+                target_p = specs_batch[:, 0]
+                target_j = specs_batch[:, 1]
+                target_h = specs_batch[:, 2]
+                target_w = specs_batch[:, 3]
+                err_p = (torch.log10(pred_p) - torch.log10(target_p.clamp(min=1e-12))) \
+                    / max(abs(float(scaler_y_p.scale_[0])), 1e-6)
+                err_j = (pred_j - target_j) / eye_scale_j
+                err_h = (pred_h - target_h) / eye_scale_h
+                err_w = (pred_w - target_w) / eye_scale_w
+                fwd_mse = torch.mean(torch.stack([
+                    err_p ** 2, err_j ** 2, err_h ** 2, err_w ** 2], dim=0))
+                power_phys = _phase_a_student_power(bounded_log)
+                power_term = power_phys.mean() / power_norm_const
+                huber_term = mse_mlp
+                if w_eff > 0:
+                    valid_nll = _phase_a_validity_nll(
+                        student, logits, scaler_X, zig_model,
+                    )
+                else:
+                    valid_nll = None
+                loss = (mlp_weight * mse_mlp + fwd_weight * fwd_mse
+                        + power_weight * power_term)
+                if w_eff > 0:
+                    loss = loss + w_eff * valid_nll
+                if first_batch_ratios is None and epoch == 0:
+                    # Epoch-1 weight-ratio log (plan §3/§9): shows the scale of
+                    # each term at initialisation so weight mismatches are
+                    # caught before an Alliance allocation is burned.
+                    def _f(t):
+                        return float(t.detach().item()) if torch.is_tensor(t) else float(t)
+                    first_batch_ratios = {
+                        "mse_mlp": _f(mse_mlp), "fwd_mse": _f(fwd_mse),
+                        "power_norm": _f(power_term),
+                        "nll": _f(valid_nll) if valid_nll is not None else 0.0,
+                    }
+                    contrib = {
+                        "mlp": mlp_weight * first_batch_ratios["mse_mlp"],
+                        "fwd": fwd_weight * first_batch_ratios["fwd_mse"],
+                        "power": power_weight * first_batch_ratios["power_norm"],
+                        "validity": w_eff * first_batch_ratios["nll"],
+                    }
+                    total0 = sum(contrib.values()) or 1.0
+                    _logger.info(
+                        "[phaseA] epoch-1 term magnitudes: "
+                        + ", ".join(f"{k}={v:.4g}" for k, v in first_batch_ratios.items())
+                        + " | weighted contributions: "
+                        + ", ".join(f"{k}={v:.4g} ({100*v/total0:.1f}%)"
+                                    for k, v in contrib.items())
+                    )
             else:
-                valid_nll = None
-                loss = huber_term
+                huber_term = huber_loss(logits, params_target, delta=0.5).mean()
+                mse_mlp = fwd_mse = power_term = None
+                if w_eff > 0:
+                    valid_nll = _phase_a_validity_nll(
+                        student, logits, scaler_X, zig_model,
+                    )
+                    loss = huber_term + w_eff * valid_nll
+                else:
+                    valid_nll = None
+                    loss = huber_term
             if not torch.isfinite(loss):
                 _logger.warning(
                     f"[phaseA] non-finite loss at epoch {epoch+1}, batch {n_batches}; skipping"
@@ -2815,11 +3099,18 @@ def run_phase_a_training(student, ctx, *, model_name: str = "phase_a_student"):
             total_huber += huber_term.item()
             if valid_nll is not None:
                 total_valid_nll += valid_nll.item()
+            if mlp_guided:
+                total_mlp_mse += float(mse_mlp.item())
+                total_fwd_mse += float(fwd_mse.item())
+                total_power += float(power_term.item()) * power_norm_const
             n_batches += 1
         scheduler.step()
         avg_train = total_loss / max(1, n_batches)
         avg_huber = total_huber / max(1, n_batches)
         avg_valid_nll = total_valid_nll / max(1, n_batches) if w_eff > 0 else float("nan")
+        avg_mlp_mse = total_mlp_mse / max(1, n_batches) if mlp_guided else float("nan")
+        avg_fwd_mse = total_fwd_mse / max(1, n_batches) if mlp_guided else float("nan")
+        avg_power = total_power / max(1, n_batches) if mlp_guided else float("nan")
         avg_val = _phase_a_huber_eval(student, val_loader, DEVICE)
         # ZIG failure eval runs only on eval epochs (or the final epoch).
         # Patience is counted in *eval cycles*: non-eval epochs must not
@@ -2829,6 +3120,9 @@ def run_phase_a_training(student, ctx, *, model_name: str = "phase_a_student"):
         val_failure_rate = float("nan")
         boundary_failure_rate = float("nan")
         interior_failure_rate = float("nan")
+        val_invalid_rate = float("nan")
+        val_degrade_rate = float("nan")
+        val_valid_mean_power = float("nan")
         if eval_this_epoch:
             evaluator.student = student
             val_specs = canonical["specs"][np.asarray(canonical["val_idx"], dtype=np.int64)]
@@ -2836,6 +3130,16 @@ def run_phase_a_training(student, ctx, *, model_name: str = "phase_a_student"):
                 val_specs, threshold=error_threshold,
             )
             val_failure_rate = float(failure_mask.mean())
+            # Plan §2/§5: invalid-vs-degrade attribution plus valid-power.
+            invalid_mask = np.asarray(metrics.get("invalid_mask", np.zeros_like(failure_mask)), dtype=bool)
+            val_invalid_rate = float(invalid_mask.mean())
+            val_degrade_rate = float((failure_mask & ~invalid_mask).mean())
+            if mlp_guided:
+                val_power, _ = _phase_a_split_power_and_mse(
+                    student, val_specs, None, scaler_y_p, DEVICE)
+                valid_designs = (~invalid_mask) & np.isfinite(val_power)
+                if valid_designs.any():
+                    val_valid_mean_power = float(val_power[valid_designs].mean())
             if "boundary_failure" in metrics and "is_boundary" in metrics:
                 bm = metrics["is_boundary"]
                 boundary_failure_rate = float(
@@ -2858,6 +3162,19 @@ def run_phase_a_training(student, ctx, *, model_name: str = "phase_a_student"):
         history["val_failure_rate"].append(val_failure_rate)
         history["val_boundary_failure"].append(boundary_failure_rate)
         history["val_interior_failure"].append(interior_failure_rate)
+        history["mlp_mse"].append(avg_mlp_mse)
+        history["fwd_mse"].append(avg_fwd_mse)
+        history["train_nll"].append(avg_valid_nll)
+        history["train_power"].append(avg_power)
+        history["train_power_norm"].append(
+            avg_power / power_norm_const if mlp_guided and np.isfinite(avg_power) else float("nan"))
+        history["loss_weights"].append({
+            "w_mlp": mlp_weight, "w_fwd": fwd_weight,
+            "w_val_eff": w_eff, "w_pwr": power_weight,
+        })
+        history["val_invalid_rate"].append(val_invalid_rate)
+        history["val_degrade_rate"].append(val_degrade_rate)
+        history["val_valid_mean_power"].append(val_valid_mean_power)
         if avg_val < best_val_loss:
             best_val_loss = avg_val
             best_val_loss_state = {k: v.detach().cpu().clone() for k, v in student.state_dict().items()}
@@ -2876,11 +3193,22 @@ def run_phase_a_training(student, ctx, *, model_name: str = "phase_a_student"):
                 )
             else:
                 fail_str = "val_fail=  --% (no ZIG eval this epoch)"
+            guided_str = (
+                f"  mlp_mse={avg_mlp_mse:.4f}  fwd_mse={avg_fwd_mse:.4f}  "
+                f"power={avg_power:.4g} ({avg_power/power_norm_const:.3f}x train-mean)"
+                if mlp_guided else ""
+            )
+            # Audit fix: in guided mode avg_huber holds MSE-to-teacher, not a
+            # Huber distance — label it honestly so Alliance logs are not
+            # misread. (val_huber stays flow-Huber in both modes by design;
+            # it feeds the best-val-loss fallback checkpoint only.)
+            _train_label = "train_mse_mlp" if mlp_guided else "train_huber"
             _logger.info(
                 f"[phaseA] epoch {epoch+1:3d}/{epochs}  "
-                f"train_huber={avg_huber:.4f}  valid_nll={avg_valid_nll:5.4f}  "
+                f"{_train_label}={avg_huber:.4f}  valid_nll={avg_valid_nll:5.4f}  "
                 f"w_valid={w_eff:.3f}  val_huber={avg_val:.4f}  "
                 f"{fail_str} patience={no_improve}/{earlystop_patience}"
+                f"{guided_str}"
             )
         if earlystop_patience > 0 and no_improve >= earlystop_patience:
             _logger.info(
@@ -2912,7 +3240,7 @@ def run_phase_a_training(student, ctx, *, model_name: str = "phase_a_student"):
             bm = metrics["is_boundary"]
             boundary_failure_rate = float(metrics["boundary_failure"].sum() / max(1, bm.sum()))
             interior_failure_rate = float(metrics["interior_failure"].sum() / max(1, (~bm).sum()))
-        final[split_name] = {
+        split_entry = {
             "failure_rate": float(failure_mask.mean()),
             "boundary_failure_rate": boundary_failure_rate,
             "interior_failure_rate": interior_failure_rate,
@@ -2920,6 +3248,23 @@ def run_phase_a_training(student, ctx, *, model_name: str = "phase_a_student"):
                 np.asarray(metrics["errors"]) >= float(ctx.get("DEGRADE_REL_THRESHOLD", 0.20))
             ).mean(axis=0).tolist(),
         }
+        if mlp_guided:
+            # Plan §5: invalid/degrade split, valid-power, and MLP-logit MSE
+            # per split. ``valid`` = p_valid >= VALIDITY_THRESHOLD & finite.
+            invalid_mask = np.asarray(
+                metrics.get("invalid_mask", np.zeros_like(failure_mask)), dtype=bool)
+            split_entry["valid_rate"] = float((~invalid_mask).mean())
+            split_power, split_mlp_mse = _phase_a_split_power_and_mse(
+                student, specs_arr,
+                canonical["mlp_logits_trial0019"][np.asarray(idx_arr, dtype=np.int64)],
+                scaler_y_p, DEVICE)
+            valid_designs = (~invalid_mask) & np.isfinite(split_power)
+            split_entry["valid_mean_power"] = (
+                float(split_power[valid_designs].mean()) if valid_designs.any() else float("nan"))
+            split_entry["valid_median_power"] = (
+                float(np.median(split_power[valid_designs])) if valid_designs.any() else float("nan"))
+            split_entry["mlp_mse"] = split_mlp_mse
+        final[split_name] = split_entry
 
     log_path = os.path.join(output_dir, "phase_a_history.json")
     with open(log_path, "w", encoding="utf-8") as handle:
@@ -2935,6 +3280,11 @@ def run_phase_a_training(student, ctx, *, model_name: str = "phase_a_student"):
             "error_threshold": error_threshold,
             "val_eval_every": val_eval_every,
             "earlystop_patience": earlystop_patience,
+            "mlp_weight": mlp_weight,
+            "fwd_weight": fwd_weight,
+            "power_weight": power_weight,
+            "power_norm_const": power_norm_const,
+            "schema_rev": schema_rev,
         }}, handle, indent=2, default=str)
     _logger.info(f"[phaseA] wrote {log_path}")
     _logger.info(
@@ -3002,7 +3352,7 @@ def _phase_a_huber_eval(student, val_loader, device):
     total_loss = 0.0
     n_batches = 0
     with torch.no_grad():
-        for specs_batch, params_target in val_loader:
+        for specs_batch, params_target, _mlp_logits in val_loader:
             specs_batch = specs_batch.to(device)
             params_target = params_target.to(device)
             logits = student(specs_batch)

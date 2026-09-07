@@ -86,6 +86,7 @@ from typing import Any
 import optuna
 import torch
 import logging
+import numpy as np
 
 _logger = logging.getLogger("kn_bayes_opt")
 from optuna.samplers import TPESampler
@@ -382,6 +383,33 @@ def _parse_final_metrics(path: Path) -> dict[str, float]:
             except ValueError:
                 continue
     return out
+
+
+def _canonical_power_reference(canonical_path) -> float:
+    """Train-mean power constant stored in the schema-2 canonical .npz.
+
+    Used to normalise ``valid_mean_power`` for the lexicographic BO tie-break
+    (plan phase-a-mlp-guided-knet §6). Falls back to 1.0 for legacy datasets.
+    """
+    global _POWER_REFERENCE_CACHE
+    key = str(canonical_path)
+    if key in _POWER_REFERENCE_CACHE:
+        return _POWER_REFERENCE_CACHE[key]
+    ref = 1.0
+    try:
+        import zipfile
+        with zipfile.ZipFile(key) as zf:
+            with zf.open("power_norm_const.npy") as fh:
+                ref = float(np.load(fh, allow_pickle=False).item())
+    except (KeyError, FileNotFoundError, ValueError, OSError, zipfile.BadZipFile):
+        ref = 1.0
+    if not np.isfinite(ref) or ref <= 0:
+        ref = 1.0
+    _POWER_REFERENCE_CACHE[key] = ref
+    return ref
+
+
+_POWER_REFERENCE_CACHE: dict[str, float] = {}
 
 
 def _parse_trainable_param_count(text: str) -> int | None:
@@ -774,7 +802,11 @@ def main() -> None:
                         help="Upper bound for linear device_l2_lambda "
                              "search (default: 1e-3).")
     parser.add_argument("--output", type=Path,
-                        default=Path("./outputs/kn_bayes_opt"))
+                        default=None,
+                        help="Output directory. Default: ./outputs/kn_bayes_opt, "
+                             "or ./outputs/phase_a_knet_bo_v2 when --ctle-phase-a "
+                             "is set (plan phase-a-mlp-guided-knet: fresh tree for "
+                             "schema-2 studies).")
     parser.add_argument("--study-name", default=None,
                         help="Optuna study name. Default: "
                              "<dataset>_knet_e<E>.")
@@ -805,6 +837,26 @@ def main() -> None:
     parser.add_argument("--ctle-phase-a-validity-ramp-epochs", type=int, default=30,
                         help="Phase-A validity linear ramp length in epochs "
                              "(default: 30, i.e. full weight from epoch 40).")
+    # Plan phase-a-mlp-guided-knet: MLP-guided 4-term loss pass-through flags
+    # (all trial-constant, not BO dimensions).
+    parser.add_argument("--ctle-phase-a-mlp-teacher-ckpt", type=Path, default=None,
+                        help="Frozen PlainMLP teacher checkpoint (e.g. trial_0019 "
+                             "dagger_student_plain.pt). Required for the MLP-guided "
+                             "loss and the schema-2 canonical dataset build.")
+    parser.add_argument("--ctle-phase-a-mlp-weight", type=float, default=1.0,
+                        help="Weight on MSE(student_logits, mlp_teacher_logits) "
+                             "(default: 1.0; 0.0 = legacy Huber-on-flow path).")
+    parser.add_argument("--ctle-phase-a-fwd-weight", type=float, default=0.0,
+                        help="Weight on the ZIG forward-consistency MSE in scaled "
+                             "spec space (default: 0.0).")
+    parser.add_argument("--ctle-phase-a-power-weight", type=float, default=0.0,
+                        help="Weight on the normalised absolute power term "
+                             "4*VDD*I / train_mean_power (default: 0.0; expected "
+                             "in [1e-4, 1e-3] after normalisation).")
+    parser.add_argument("--ctle-phase-a-power-norm", default="train_mean",
+                        choices=["train_mean"],
+                        help="Power normalisation mode (default: train_mean; the "
+                             "constant is stored in the canonical dataset).")
     parser.add_argument("--ctle-multifidelity",
                         action=argparse.BooleanOptionalAction, default=True,
                         help="Use successive-halving DAgger prefixes for CTLE "
@@ -884,6 +936,13 @@ def main() -> None:
             f"--num-hidden-max ({num_hidden_max})"
         )
 
+    # Plan phase-a-mlp-guided-knet: schema-2 Phase-A studies default to a
+    # fresh output tree so they can never mix with legacy phase_a_knet_bo runs.
+    if args.output is None:
+        args.output = (
+            Path("./outputs/phase_a_knet_bo_v2") if args.ctle_phase_a
+            else Path("./outputs/kn_bayes_opt")
+        )
     out_dir = args.output.resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
     run_dir = out_dir / f"{args.dataset}_knet_e{args.epochs}"
@@ -1034,6 +1093,25 @@ def main() -> None:
         "n_arches": len(feasible_now) if feasible_now is not None else 0,
         "ctle_phase_a": bool(args.ctle_phase_a),
         "ctle_objective": args.ctle_objective,
+        # Plan phase-a-mlp-guided-knet: schema-2 studies must refuse schema-1
+        # DBs (and vice versa) — stale studies fail fast on resume.
+        # Audit fix: derive from the guided loss weights (not just the ckpt
+        # flag) so a schema-2 training run that reuses an existing .npz
+        # without passing --ctle-phase-a-mlp-teacher-ckpt still fingerprints
+        # as rev 2 and can never resume a legacy rev-1 study.
+        "ctle_phase_a_schema_rev": 2 if (
+            args.ctle_phase_a and (
+                args.ctle_phase_a_mlp_teacher_ckpt is not None
+                or args.ctle_phase_a_mlp_weight > 0
+                or args.ctle_phase_a_fwd_weight > 0
+                or args.ctle_phase_a_power_weight > 0)) else 1,
+        "ctle_phase_a_mlp_teacher": (
+            str(args.ctle_phase_a_mlp_teacher_ckpt)
+            if args.ctle_phase_a_mlp_teacher_ckpt is not None else None),
+        "ctle_phase_a_mlp_weight": float(args.ctle_phase_a_mlp_weight),
+        "ctle_phase_a_fwd_weight": float(args.ctle_phase_a_fwd_weight),
+        "ctle_phase_a_power_weight": float(args.ctle_phase_a_power_weight),
+        "ctle_phase_a_power_norm": str(args.ctle_phase_a_power_norm),
     })
 
     # study_was_resumed was captured next to db_path above (pre-create state).
@@ -1172,6 +1250,11 @@ def main() -> None:
             trial_dir = run_dir / f"trial_{trial.number:04d}"
             log_path = run_dir / f"trial_{trial.number:04d}.log.txt"
             dagger_script = str((Path(__file__).parent / "dagger-nuance-distillation-kirchhoffnet.py").resolve())
+            # Audit fix: the shared tail below adds ``lex_obj_offset`` to the
+            # param-penalized value. The legacy DAgger path never sets it, so
+            # default to 0.0 here — otherwise non-Phase-A CTLE trials crash
+            # with NameError at return time.
+            lex_obj_offset = 0.0
             if args.ctle_phase_a:
                 # Canonical Phase-A mode (plan canonical-ctle-unify): static
                 # data, Huber + ramped ZIG-validity NLL, no DAgger.  The KNet
@@ -1183,6 +1266,15 @@ def main() -> None:
                         "--ctle-phase-a requires --ctle-canonical-dataset <path> "
                         "so every trial sees the same flow-labelled canonical data."
                     )
+                if args.ctle_prepare_canonical_dataset:
+                    # Schema-2 build (plan phase-a-mlp-guided-knet): the MLP
+                    # teacher logits column must exist in the shared .npz.
+                    if args.ctle_phase_a_mlp_teacher_ckpt is None:
+                        raise ValueError(
+                            "--ctle-prepare-canonical-dataset with the MLP-guided loss "
+                            "requires --ctle-phase-a-mlp-teacher-ckpt <path> so the "
+                            "schema-2 'mlp_logits_trial0019' column is built once."
+                        )
                 cmd = [
                     python_exe, dagger_script,
                     "--canonical-dataset", str(args.ctle_canonical_dataset),
@@ -1208,10 +1300,17 @@ def main() -> None:
                     "--phase-a-validity-weight", f"{args.ctle_phase_a_validity_weight:.6f}",
                     "--phase-a-validity-ramp-start", str(args.ctle_phase_a_validity_ramp_start),
                     "--phase-a-validity-ramp-epochs", str(args.ctle_phase_a_validity_ramp_epochs),
+                    "--phase-a-mlp-weight", f"{args.ctle_phase_a_mlp_weight:.6f}",
+                    "--phase-a-fwd-weight", f"{args.ctle_phase_a_fwd_weight:.6f}",
+                    "--phase-a-power-weight", f"{args.ctle_phase_a_power_weight:.6f}",
+                    "--phase-a-power-norm", str(args.ctle_phase_a_power_norm),
                     "--output", str(trial_dir),
                     "--device", device,
                     "--seed", str(args.seed),
                 ]
+                if args.ctle_phase_a_mlp_teacher_ckpt is not None:
+                    cmd += ["--phase-a-mlp-teacher-ckpt",
+                            str(args.ctle_phase_a_mlp_teacher_ckpt)]
                 if t_span is not None:
                     cmd += ["--t-span", f"{t_span:.6f}"]
                 bfo = seed_boundary_map if seed_boundary_map is not None else build_boundary_fan_out(
@@ -1319,21 +1418,54 @@ def main() -> None:
                     trial.set_user_attr("penalized", True)
                     trial.set_user_attr("penalty_reason", f"phaseA: missing {split} failure_rate")
                     return args.invalid_param_objective
-                objective_value = float(final[split]["failure_rate"])
+                raw_failure = float(final[split]["failure_rate"])
+                objective_value = raw_failure
                 val_value = float(final.get("val", {}).get("failure_rate", objective_value))
                 test_value = float(final.get("test", {}).get("failure_rate", objective_value))
                 trial.set_user_attr("phase_a_validation_failure_rate", val_value)
                 trial.set_user_attr("phase_a_test_failure_rate", test_value)
                 trial.set_user_attr("test_failure_rate", test_value)
                 trial.set_user_attr("validation_failure_rate", val_value)
+                # Plan phase-a-mlp-guided-knet: lexicographic tie-break on
+                # (failure, valid_mean_power, val_mlp_mse). Optuna is kept
+                # single-objective; tiny epsilon offsets order trials with
+                # identical failure rates. valid_mean_power is normalised by
+                # the dataset train-mean power so the offset is O(1e-4).
+                valid_mean_power = float(
+                    final.get(split, {}).get("valid_mean_power", float("nan")))
+                val_mlp_mse = float(
+                    final.get(split, {}).get("mlp_mse", float("nan")))
+                power_ref = _canonical_power_reference(args.ctle_canonical_dataset)
+                lex_offset = 0.0
+                # Audit fix: gate on any guided weight (mlp/fwd/power), matching
+                # the ``mlp_guided`` definition in run_phase_a_training. A
+                # fwd-only run previously skipped the tie-break entirely.
+                if (args.ctle_phase_a_mlp_weight > 0 or args.ctle_phase_a_fwd_weight > 0
+                        or args.ctle_phase_a_power_weight > 0):
+                    if np.isfinite(valid_mean_power) and valid_mean_power > 0:
+                        lex_offset += 1e-4 * (valid_mean_power / power_ref - 1.0)
+                    if np.isfinite(val_mlp_mse):
+                        lex_offset += 1e-6 * val_mlp_mse
+                    objective_value = float(objective_value) + lex_offset
+                trial.set_user_attr("phase_a_valid_mean_power",
+                                    valid_mean_power if np.isfinite(valid_mean_power) else None)
+                trial.set_user_attr("phase_a_val_mlp_mse",
+                                    val_mlp_mse if np.isfinite(val_mlp_mse) else None)
                 # Bind the shared tail variables: the common return path
                 # below reads test_rate/validation_rate/param_count/base_metric.
+                # ``base_metric`` is the raw failure rate (param penalty scales
+                # the metric; the lex offset below is tiny and would inflate
+                # the penalty, so the param-scaled value is computed off the
+                # raw metric and the offset is added back at the very end).
                 test_rate = test_value
                 validation_rate = val_value
                 param_count = preflight_params
-                base_metric = objective_value
+                base_metric = raw_failure
+                lex_obj_offset = objective_value - raw_failure
                 print(f"[ctle] trial {trial.number} phaseA {args.ctle_objective} "
-                      f"{base_metric*100:.2f}% (val {val_value*100:.2f}% test {test_value*100:.2f}%)",
+                      f"{raw_failure*100:.2f}% (val {val_value*100:.2f}% test {test_value*100:.2f}%)"
+                      + (f" lex_offset={lex_offset:+.4g}"
+                         if abs(lex_offset) > 0 else ""),
                       flush=True)
             else:
                 for rung_index, rung_iterations in enumerate(ctle_rungs):
@@ -1420,6 +1552,7 @@ def main() -> None:
                     ratio = param_count / max(1, param_limit)
                     return float(args.invalid_param_objective) * (ratio ** 2)
             penalized = _penalized_objective(base_metric, param_count or 0, param_reference, args.param_penalty)
+            penalized = penalized + lex_obj_offset
             trial.set_user_attr("raw_test_rate", base_metric)
             trial.set_user_attr("penalized_value", penalized)
             print(f"[ctle] trial {trial.number} Test {test_rate*100:.2f}% penalized {penalized*100:.2f}%", flush=True)
@@ -1694,6 +1827,14 @@ def main() -> None:
         f.write(f"phase_a_validity_weight: {args.ctle_phase_a_validity_weight}\n")
         f.write(f"phase_a_validity_ramp_start: {args.ctle_phase_a_validity_ramp_start}\n")
         f.write(f"phase_a_validity_ramp_epochs: {args.ctle_phase_a_validity_ramp_epochs}\n")
+        f.write(f"phase_a_mlp_teacher_ckpt: {args.ctle_phase_a_mlp_teacher_ckpt}\n")
+        f.write(f"phase_a_mlp_weight: {args.ctle_phase_a_mlp_weight}\n")
+        f.write(f"phase_a_fwd_weight: {args.ctle_phase_a_fwd_weight}\n")
+        f.write(f"phase_a_power_weight: {args.ctle_phase_a_power_weight}\n")
+        f.write(f"phase_a_power_norm: {args.ctle_phase_a_power_norm}\n")
+        # Audit fix: same weights-based rev derivation as the study fingerprint.
+        f.write(f"phase_a_schema_rev: "
+                f"{2 if (args.ctle_phase_a and (args.ctle_phase_a_mlp_teacher_ckpt is not None or args.ctle_phase_a_mlp_weight > 0 or args.ctle_phase_a_fwd_weight > 0 or args.ctle_phase_a_power_weight > 0)) else 1}\n")
         f.write(f"n_trials: {args.n_trials}\n")
         f.write(f"n_workers: {n_workers}\n")
         f.write(f"device: {device}\n")
@@ -1748,6 +1889,8 @@ def main() -> None:
             "penalized", "penalized_value", "penalty_reason",
             "phase_a_validity_weight", "phase_a_validity_ramp_start",
             "phase_a_validity_ramp_epochs",
+            "phase_a_mlp_weight", "phase_a_fwd_weight", "phase_a_power_weight",
+            "phase_a_valid_mean_power", "phase_a_val_mlp_mse",
         ])
         for t in study.trials:
             # New studies carry arch dims inside the joint tuple via
@@ -1800,6 +1943,11 @@ def main() -> None:
                 args.ctle_phase_a_validity_weight,
                 args.ctle_phase_a_validity_ramp_start,
                 args.ctle_phase_a_validity_ramp_epochs,
+                args.ctle_phase_a_mlp_weight,
+                args.ctle_phase_a_fwd_weight,
+                args.ctle_phase_a_power_weight,
+                t.user_attrs.get("phase_a_valid_mean_power", ""),
+                t.user_attrs.get("phase_a_val_mlp_mse", ""),
             ])
 
     _plot_history(
