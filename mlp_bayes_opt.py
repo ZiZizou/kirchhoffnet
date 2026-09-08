@@ -58,6 +58,8 @@ import optuna
 import torch
 from optuna.samplers import TPESampler
 
+import numpy as np
+
 import bo_param_sampling as bps
 
 
@@ -220,6 +222,71 @@ def derive_hidden_dim(*, num_layers: int, budget: int,
     if h < 1:
         return -1
     return h
+
+
+def _canonical_power_reference(canonical_path) -> float:
+    """Train-mean power constant stored in the schema-2 canonical .npz.
+
+    Used to normalise ``valid_mean_power`` for the lexicographic BO tie-break
+    (plan phase-a-mlp-guided-knet §6). Falls back to 1.0 for legacy datasets.
+    Mirrors ``kn_bayes_opt._canonical_power_reference``.
+    """
+    global _POWER_REFERENCE_CACHE
+    key = str(canonical_path)
+    if key in _POWER_REFERENCE_CACHE:
+        return _POWER_REFERENCE_CACHE[key]
+    ref = 1.0
+    try:
+        import zipfile
+        with zipfile.ZipFile(key) as zf:
+            with zf.open("power_norm_const.npy") as fh:
+                ref = float(np.load(fh, allow_pickle=False).item())
+    except (KeyError, FileNotFoundError, ValueError, OSError, zipfile.BadZipFile):
+        ref = 1.0
+    if not np.isfinite(ref) or ref <= 0:
+        ref = 1.0
+    _POWER_REFERENCE_CACHE[key] = ref
+    return ref
+
+
+_POWER_REFERENCE_CACHE: dict[str, float] = {}
+
+
+def _phase_a_guided_lex_offset(*, final, split: str, canonical_path,
+                               mlp_weight: float, fwd_weight: float,
+                               power_weight: float) -> tuple[float, float | None, float | None]:
+    """Lexicographic tie-break epsilon for guided Phase-A trials (KNet parity).
+
+    Pure CPU-only helper: orders trials with identical failure rates by
+    ``(valid_mean_power, mlp_mse)`` via a tiny epsilon offset. Returns
+    ``(lex_offset, valid_mean_power_or_None, mlp_mse_or_None)``. The caller
+    adds the offset AFTER the param penalty so the epsilon is never scaled
+    by model size, exactly mirroring ``kn_bayes_opt``.
+    """
+    if not (float(mlp_weight) > 0 or float(fwd_weight) > 0 or float(power_weight) > 0):
+        return 0.0, None, None
+    split_entry = final.get(split, {}) if isinstance(final, dict) else {}
+    if not isinstance(split_entry, dict):
+        split_entry = {}
+    try:
+        valid_mean_power = float(split_entry.get("valid_mean_power", float("nan")))
+    except (TypeError, ValueError):
+        valid_mean_power = float("nan")
+    try:
+        mlp_mse = float(split_entry.get("mlp_mse", float("nan")))
+    except (TypeError, ValueError):
+        mlp_mse = float("nan")
+    offset = 0.0
+    power_ref = _canonical_power_reference(canonical_path)
+    if np.isfinite(valid_mean_power) and valid_mean_power > 0:
+        offset += 1e-4 * (valid_mean_power / power_ref - 1.0)
+    if np.isfinite(mlp_mse):
+        offset += 1e-6 * mlp_mse
+    return (
+        offset,
+        valid_mean_power if np.isfinite(valid_mean_power) else None,
+        mlp_mse if np.isfinite(mlp_mse) else None,
+    )
 
 
 def _parse_final_metrics(path: Path) -> dict[str, float]:
@@ -405,6 +472,29 @@ def main() -> None:
                              "from a single trial run, then exit before BO starts.")
     parser.add_argument("--ctle-objective", choices=["validation", "test"], default="validation",
                         help="CTLE BO objective source (default: validation; fixes the test-leakage bug).")
+    # Plan phase-a-mlp-guided-knet: MLP-guided 4-term loss flags. Defaults
+    # match kn_bayes_opt so the two controllers consume the same canonical
+    # dataset and train the same loss (parity for cross-architecture
+    # shootouts). Pass 0.0 weights + no teacher ckpt to reproduce the
+    # legacy Huber-on-flow path.
+    parser.add_argument("--ctle-phase-a-mlp-teacher-ckpt", type=Path, default=None,
+                        help="Frozen PlainMLP teacher checkpoint (e.g. trial_0019 "
+                             "dagger_student_plain.pt). Required for the MLP-guided "
+                             "loss and for preparing a schema-2 canonical dataset.")
+    parser.add_argument("--ctle-phase-a-mlp-weight", type=float, default=1.0,
+                        help="Weight on MSE(student_logits, mlp_teacher_logits) "
+                             "(default 1.0; 0.0 = legacy Huber-on-flow path).")
+    parser.add_argument("--ctle-phase-a-fwd-weight", type=float, default=1.0,
+                        help="Weight on the ZIG forward-consistency MSE in scaled "
+                             "spec space (default 1.0).")
+    parser.add_argument("--ctle-phase-a-power-weight", type=float, default=0.0005,
+                        help="Weight on the normalised absolute power term "
+                             "4*VDD*I / train_mean_power (default 5e-4; expected "
+                             "in [1e-4, 1e-3] after normalisation).")
+    parser.add_argument("--ctle-phase-a-power-norm", default="train_mean",
+                        choices=["train_mean"],
+                        help="Power normalisation mode (default: train_mean; the "
+                             "constant is stored in the canonical dataset).")
     args = parser.parse_args()
 
     if args.param_tolerance < 0.0:
@@ -414,6 +504,26 @@ def main() -> None:
     if (args.ctle_dagger_iterations < 1 or args.ctle_epochs_per_iter < 1
             or args.ctle_common_eval_size < 1 or args.ctle_earlystop_eval_every < 1):
         raise ValueError("CTLE iteration, epoch, evaluation-size, and evaluation-frequency values must be >= 1")
+
+    # Plan phase-a-mlp-guided-knet: a guided build needs the frozen MLP
+    # teacher to label the canonical dataset. Mirror kn_bayes_opt's gate
+    # here so the failure surfaces inside the BO loop instead of at
+    # trial-subprocess time (where every retry re-pays the DAgger boot).
+    if args.dataset == "ctle" and args.ctle_phase_a:
+        _guided = (
+            args.ctle_phase_a_mlp_weight > 0.0
+            or args.ctle_phase_a_fwd_weight > 0.0
+            or args.ctle_phase_a_power_weight > 0.0
+        )
+        if _guided and args.ctle_phase_a_mlp_teacher_ckpt is None:
+            raise ValueError(
+                "Guided Phase-A loss requested (mlp/fwd/power weight > 0) but "
+                "--ctle-phase-a-mlp-teacher-ckpt is unset. The schema-2 canonical "
+                "dataset requires the frozen PlainMLP teacher logits column; "
+                "either pass --ctle-phase-a-mlp-teacher-ckpt <path/to/dagger_student_plain.pt> "
+                "or set all three guided weights to 0.0 to reproduce the legacy "
+                "Huber-on-flow path."
+            )
 
     cfg = DATASETS[args.dataset]
     in_dim: int = cfg["in_dim"]
@@ -514,6 +624,24 @@ def main() -> None:
         "n_arches": (len(moe_feasible) if args.dataset == "ctle" else len(plain_feasible)),
         "ctle_phase_a": bool(args.ctle_phase_a),
         "ctle_objective": args.ctle_objective,
+        # Plan phase-a-mlp-guided-knet: schema-2 MLP BO studies must refuse
+        # schema-1 .db resume (and vice versa). Derive from the guided loss
+        # weights + teacher ckpt, mirroring kn_bayes_opt, so a guided run
+        # without an explicit --ctle-phase-a-mlp-teacher-ckpt still
+        # fingerprints as rev 2 when any guided weight is non-zero.
+        "ctle_phase_a_schema_rev": 2 if (
+            args.ctle_phase_a and (
+                args.ctle_phase_a_mlp_teacher_ckpt is not None
+                or args.ctle_phase_a_mlp_weight > 0
+                or args.ctle_phase_a_fwd_weight > 0
+                or args.ctle_phase_a_power_weight > 0)) else 1,
+        "ctle_phase_a_mlp_teacher": (
+            str(args.ctle_phase_a_mlp_teacher_ckpt)
+            if args.ctle_phase_a_mlp_teacher_ckpt is not None else None),
+        "ctle_phase_a_mlp_weight": float(args.ctle_phase_a_mlp_weight),
+        "ctle_phase_a_fwd_weight": float(args.ctle_phase_a_fwd_weight),
+        "ctle_phase_a_power_weight": float(args.ctle_phase_a_power_weight),
+        "ctle_phase_a_power_norm": str(args.ctle_phase_a_power_norm),
     })
     if args.resume and (run_dir / (study_name + ".db")).exists():
         study = optuna.load_study(study_name=study_name, storage=storage,
@@ -658,7 +786,17 @@ def main() -> None:
                     "--device", device,
                     "--seed", str(args.seed),
                     "--input-preprocessing", args.input_preprocessing,
+                    # Plan phase-a-mlp-guided-knet: forward the guided-loss
+                    # flags + teacher ckpt so the subprocess trains the same
+                    # 4-term loss as kn_bayes_opt (parity requirement).
+                    "--phase-a-mlp-weight", f"{args.ctle_phase_a_mlp_weight:.6f}",
+                    "--phase-a-fwd-weight", f"{args.ctle_phase_a_fwd_weight:.6f}",
+                    "--phase-a-power-weight", f"{args.ctle_phase_a_power_weight:.6f}",
+                    "--phase-a-power-norm", str(args.ctle_phase_a_power_norm),
                 ]
+                if args.ctle_phase_a_mlp_teacher_ckpt is not None:
+                    cmd += ["--phase-a-mlp-teacher-ckpt",
+                            str(args.ctle_phase_a_mlp_teacher_ckpt)]
             else:
                 # 4×100 DAgger proxy (legacy path)
                 cmd = [
@@ -702,39 +840,87 @@ def main() -> None:
             # them inline as ``Validation failure rate: X%`` and
             # ``Test failure rate: X%``.
             objective_value = None
+            val_value: float | None = None
+            test_value: float | None = None
+            # Lexicographic tie-break offset (phase-a-mlp-guided-knet §6).
+            # Kept separate from the raw metric so the param penalty scales
+            # the raw failure rate only; the epsilon is added back after the
+            # penalty, exactly mirroring ``kn_bayes_opt`` (penalty on raw
+            # base, offset added at the very end).
+            lex_offset = 0.0
             if args.ctle_phase_a:
                 import json as _json
                 hist_path = trial_dir / "phase_a_history.json"
                 if hist_path.is_file():
                     with open(hist_path, encoding="utf-8") as _hf:
                         hist = _json.load(_hf)
+                    final = hist.get("final", {})
+                    if isinstance(final.get("val"), dict) and "failure_rate" in final["val"]:
+                        val_value = float(final["val"]["failure_rate"])
+                    if isinstance(final.get("test"), dict) and "failure_rate" in final["test"]:
+                        test_value = float(final["test"]["failure_rate"])
                     split = "val" if args.ctle_objective == "validation" else "test"
-                    if "final" in hist and split in hist["final"]:
-                        objective_value = float(hist["final"][split]["failure_rate"])
+                    if split in final and "failure_rate" in final[split]:
+                        objective_value = float(final[split]["failure_rate"])
+                    # Plan phase-a-mlp-guided-knet: lexicographic tie-break on
+                    # (failure, valid_mean_power, mlp_mse). Delegates to the
+                    # pure helper so the math is unit-testable without a GPU;
+                    # the offset is added AFTER the param penalty below.
+                    if objective_value is not None and (
+                        args.ctle_phase_a_mlp_weight > 0
+                        or args.ctle_phase_a_fwd_weight > 0
+                        or args.ctle_phase_a_power_weight > 0
+                    ):
+                        lex_offset, _vmp, _mse = _phase_a_guided_lex_offset(
+                            final=final, split=split,
+                            canonical_path=args.ctle_canonical_dataset,
+                            mlp_weight=args.ctle_phase_a_mlp_weight,
+                            fwd_weight=args.ctle_phase_a_fwd_weight,
+                            power_weight=args.ctle_phase_a_power_weight,
+                        )
+                        trial.set_user_attr("phase_a_valid_mean_power", _vmp)
+                        trial.set_user_attr("phase_a_val_mlp_mse", _mse)
             else:
                 if args.ctle_objective == "validation":
                     vm = re.search(r"Validation failure rate:\s*([\d\.]+)%", text)
                     if vm:
-                        objective_value = float(vm.group(1)) / 100.0
-                if objective_value is None:
+                        val_value = float(vm.group(1)) / 100.0
+                        objective_value = val_value
+                if test_value is None:
                     m = re.search(r"Test failure rate:\s*([\d\.]+)%", text)
                     if m:
-                        objective_value = float(m.group(1)) / 100.0
+                        test_value = float(m.group(1)) / 100.0
+                        if objective_value is None:
+                            objective_value = test_value
             if objective_value is None:
                 trial.set_user_attr("penalized", True)
                 trial.set_user_attr("penalty_reason",
                                     f"missing {args.ctle_objective} failure rate in log")
                 return _over_budget_objective(soft_limit + 1, soft_limit,
                                               args.invalid_param_objective)
-            test_rate = objective_value
+            # NOTE (phase-a-mlp-guided-knet): ``test_failure_rate`` now
+            # always holds the TEST split rate (previously it held whatever
+            # split the objective used, i.e. the validation rate under
+            # ``--ctle-objective validation``). Consumers comparing across
+            # studies must use ``phase_a_validation_failure_rate`` /
+            # ``phase_a_test_failure_rate`` explicitly; ``raw_test_rate``
+            # holds the raw objective-split rate before penalty/lex offset.
+            trial.set_user_attr("test_failure_rate",
+                                test_value if test_value is not None else objective_value)
+            if val_value is not None:
+                trial.set_user_attr("validation_failure_rate", val_value)
+            if test_value is not None:
+                trial.set_user_attr("phase_a_test_failure_rate", test_value)
+            if val_value is not None:
+                trial.set_user_attr("phase_a_validation_failure_rate", val_value)
+            trial.set_user_attr("moe_trunk_width", trunk_width)
+            trial.set_user_attr("moe_trunk_layers", trunk_layers)
+            trial.set_user_attr("moe_num_experts", num_experts)
             # Parse actual param count for --param-budget penalty (mlp dagger logs "Student model: X params")
             pm = re.search(r"Student model:\s*([0-9,]+)\s*params", text)
             if pm is None:
                 pm = re.search(r"trainable params:\s*([0-9,]+)", text, re.I)
             param_count = int(pm.group(1).replace(",", "")) if pm else None
-            trial.set_user_attr("test_failure_rate", test_rate)
-            trial.set_user_attr("moe_trunk_width", trunk_width)
-            trial.set_user_attr("moe_num_experts", num_experts)
             if param_count is not None:
                 trial.set_user_attr("param_count", param_count)
                 trial.set_user_attr("actual_params", param_count)
@@ -744,9 +930,13 @@ def main() -> None:
                                         f"post-run params={param_count} > soft cap {soft_limit}")
                     return _over_budget_objective(
                         param_count, soft_limit, args.invalid_param_objective)
-            # Obey --param-budget via same penalized objective as kn_bayes/mlp non-CTLE
-            penalized = _penalized_objective(test_rate, param_count or 0, param_budget, args.param_penalty)
-            trial.set_user_attr("raw_test_rate", test_rate)
+            # Obey --param-budget via same penalized objective as kn_bayes/mlp non-CTLE.
+            # The penalty scales the RAW failure rate; the lexicographic
+            # tie-break epsilon is added back afterwards so it is never
+            # multiplied by the size penalty (KNet parity).
+            penalized = _penalized_objective(objective_value, param_count or 0, param_budget, args.param_penalty)
+            penalized = penalized + lex_offset
+            trial.set_user_attr("raw_test_rate", objective_value)
             trial.set_user_attr("penalized_value", penalized)
             return penalized
 
@@ -853,6 +1043,11 @@ def main() -> None:
         f.write(f"phase_a_validity_weight: {args.ctle_phase_a_validity_weight}\n")
         f.write(f"phase_a_validity_ramp_start: {args.ctle_phase_a_validity_ramp_start}\n")
         f.write(f"phase_a_validity_ramp_epochs: {args.ctle_phase_a_validity_ramp_epochs}\n")
+        f.write(f"phase_a_mlp_teacher_ckpt: {args.ctle_phase_a_mlp_teacher_ckpt}\n")
+        f.write(f"phase_a_mlp_weight: {args.ctle_phase_a_mlp_weight}\n")
+        f.write(f"phase_a_fwd_weight: {args.ctle_phase_a_fwd_weight}\n")
+        f.write(f"phase_a_power_weight: {args.ctle_phase_a_power_weight}\n")
+        f.write(f"phase_a_power_norm: {args.ctle_phase_a_power_norm}\n")
         f.write(f"n_trials: {args.n_trials}\n")
         f.write(f"n_workers: {n_workers}\n")
         f.write(f"device: {device}\n")
@@ -862,11 +1057,22 @@ def main() -> None:
             f.write(f"best_trial_number: {bt.number}\n")
             f.write(f"best_value: {study.best_value:.6f}\n")
             f.write(f"hidden_dim: {bt.user_attrs.get('hidden_dim')}\n")
+            f.write(f"moe_trunk_width: {bt.user_attrs.get('moe_trunk_width')}\n")
+            f.write(f"moe_trunk_layers: {bt.user_attrs.get('moe_trunk_layers')}\n")
+            f.write(f"moe_num_experts: {bt.user_attrs.get('moe_num_experts')}\n")
             f.write(f"actual_params: {bt.user_attrs.get('actual_params')}\n")
             f.write(f"raw_objective: {bt.user_attrs.get('raw_objective')}\n")
             f.write(f"normalized_param_count: {bt.user_attrs.get('normalized_param_count')}\n")
             f.write(f"subprocess_seconds: {bt.user_attrs.get('subprocess_seconds')}\n")
             f.write(f"gpu: {bt.user_attrs.get('gpu', -1)}\n")
+            f.write(f"phase_a_validation_failure_rate: {bt.user_attrs.get('phase_a_validation_failure_rate')}\n")
+            f.write(f"phase_a_test_failure_rate: {bt.user_attrs.get('phase_a_test_failure_rate')}\n")
+            f.write(f"phase_a_valid_mean_power: {bt.user_attrs.get('phase_a_valid_mean_power')}\n")
+            f.write(f"phase_a_val_mlp_mse: {bt.user_attrs.get('phase_a_val_mlp_mse')}\n")
+            f.write(f"phase_a_mlp_teacher_ckpt: {args.ctle_phase_a_mlp_teacher_ckpt}\n")
+            f.write(f"phase_a_mlp_weight: {args.ctle_phase_a_mlp_weight}\n")
+            f.write(f"phase_a_fwd_weight: {args.ctle_phase_a_fwd_weight}\n")
+            f.write(f"phase_a_power_weight: {args.ctle_phase_a_power_weight}\n")
             f.write("params:\n")
             for k, v in bt.params.items():
                 f.write(f"  {k}: {v}\n")
@@ -879,22 +1085,33 @@ def main() -> None:
     with open(csv_path, "w", newline="") as f:
         w = csv.writer(f)
         w.writerow([
-            "trial", "state", "hidden_dim", "actual_params", "num_layers",
+            "trial", "state", "hidden_dim", "moe_trunk_width", "moe_trunk_layers",
+            "moe_num_experts", "actual_params", "num_layers",
             "lr", "weight_decay", "batch_size", "activation", "loss",
             "device", "gpu", "objective", "objective_value",
             "best_val", "best_epoch", "best_rmse_orig", "best_mae_orig",
             "best_mape_orig", "final_val", "elapsed_seconds",
+            "validation_failure_rate", "test_failure_rate",
+            "phase_a_validation_failure_rate", "phase_a_test_failure_rate",
+            "phase_a_valid_mean_power", "phase_a_val_mlp_mse",
             "raw_objective", "normalized_param_count", "param_penalty",
             "penalized", "penalized_value", "penalty_reason",
             "phase_a_validity_weight", "phase_a_validity_ramp_start",
             "phase_a_validity_ramp_epochs",
+            "phase_a_mlp_weight", "phase_a_fwd_weight", "phase_a_power_weight",
         ])
         for t in study.trials:
             actual_params = t.user_attrs.get("actual_params", -1)
             hidden_dim = t.user_attrs.get("hidden_dim", -1)
+            moe_w = t.user_attrs.get("moe_trunk_width")
+            moe_l = t.user_attrs.get("moe_trunk_layers")
+            moe_e = t.user_attrs.get("moe_num_experts")
+            # Plain-MLP trials set hidden_dim; CTLE MoE trials set the MoE
+            # attrs.  Fall through to plain width for non-CTLE rows.
             w.writerow([
                 t.number, t.state.name,
-                hidden_dim, actual_params,
+                hidden_dim, moe_w, moe_l, moe_e,
+                actual_params,
                 t.params.get("num_layers"),
                 t.params.get("lr"),
                 t.params.get("weight_decay"),
@@ -911,6 +1128,12 @@ def main() -> None:
                 t.user_attrs.get("best_mape_orig"),
                 t.user_attrs.get("final_val"),
                 t.user_attrs.get("subprocess_seconds"),
+                t.user_attrs.get("validation_failure_rate"),
+                t.user_attrs.get("test_failure_rate"),
+                t.user_attrs.get("phase_a_validation_failure_rate"),
+                t.user_attrs.get("phase_a_test_failure_rate"),
+                t.user_attrs.get("phase_a_valid_mean_power"),
+                t.user_attrs.get("phase_a_val_mlp_mse"),
                 t.user_attrs.get("raw_objective"),
                 t.user_attrs.get("normalized_param_count"),
                 t.user_attrs.get("param_penalty"),
@@ -920,6 +1143,9 @@ def main() -> None:
                 args.ctle_phase_a_validity_weight,
                 args.ctle_phase_a_validity_ramp_start,
                 args.ctle_phase_a_validity_ramp_epochs,
+                args.ctle_phase_a_mlp_weight,
+                args.ctle_phase_a_fwd_weight,
+                args.ctle_phase_a_power_weight,
             ])
 
     _plot_history(

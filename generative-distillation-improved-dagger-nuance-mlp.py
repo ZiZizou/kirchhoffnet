@@ -201,6 +201,32 @@ try:
     _bo_parser.add_argument('--phase-a-validity-ramp-epochs', type=int, default=30,
                             help='Linear ramp length in epochs to full validity weight '
                                  '(default 30, i.e. full weight from epoch 40).')
+    # Plan phase-a-mlp-guided-knet: MLP-guided 4-term loss flags. Defaults
+    # match the KNet BO script (mlp 1.0 + fwd 1.0 + power 5e-4) so the two
+    # controllers consume the same canonical dataset and train the same loss.
+    _bo_parser.add_argument('--phase-a-mlp-teacher-ckpt', type=str, default=None,
+                            help='Path to the frozen PlainMLP teacher checkpoint '
+                                 '(e.g. trial_0019 dagger_student_plain.pt). Required for '
+                                 'the MLP-guided loss and for preparing a schema-2 '
+                                 'canonical dataset.')
+    _bo_parser.add_argument('--phase-a-mlp-weight', type=float, default=1.0,
+                            help='Weight on MSE(student_logits, mlp_teacher_logits) '
+                                 '(default 1.0; 0.0 = legacy Huber-on-flow path).')
+    _bo_parser.add_argument('--phase-a-fwd-weight', type=float, default=1.0,
+                            help='Weight on the ZIG forward-consistency MSE '
+                                 '(scaled spec space; default 1.0).')
+    _bo_parser.add_argument('--phase-a-power-weight', type=float, default=0.0005,
+                            help='Weight on the normalised absolute power term '
+                                 '4*VDD*I / train_mean_power (default 5e-4; expected '
+                                 'in [1e-4, 1e-3] after normalisation).')
+    _bo_parser.add_argument('--phase-a-power-norm', type=str, default='train_mean',
+                            choices=['train_mean'],
+                            help='Power normalisation mode (only train_mean is '
+                                 'supported; the constant is stored in the '
+                                 'canonical dataset).')
+    _bo_parser.add_argument('--phase-a-power-norm-const', type=float, default=None,
+                            help='Override the train-mean power constant (defaults '
+                                 'to the value stored in the canonical dataset).')
     _bo_args, _ = _bo_parser.parse_known_args()
     if _bo_args.dagger_iterations is not None:
         DAGGER_ITERATIONS = _bo_args.dagger_iterations
@@ -2575,6 +2601,50 @@ scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
 if _bo_args.canonical_dataset is not None or _bo_args.prepare_canonical_dataset is not None:
     from ctle_dagger_common import (create_canonical_flow_dataset,
                                      load_canonical_flow_dataset, run_phase_a_training)
+    # Plan phase-a-mlp-guided-knet: a guided (mlp/fwd/power > 0) build needs
+    # the frozen MLP teacher to label the canonical dataset and stamp
+    # schema_rev >= 2 with the 'mlp_logits_trial0019' column. A guided run
+    # without a teacher ckpt cannot produce the required columns, so refuse
+    # the build at the gate rather than silently stamp a schema-1 .npz that
+    # a downstream guided trial would crash on (common.py raises at runtime
+    # but with a less actionable message and after teacher-labelling has
+    # already paid its cost).
+    # NOTE: the guided weights default to ON (mlp 1.0 / fwd 1.0 / power
+    # 5e-4, KNet parity), so a standalone --canonical-dataset invocation
+    # without --phase-a-mlp-teacher-ckpt now raises; pass explicit 0.0
+    # weights for the legacy Huber-on-flow path.
+    _guided_requested = (
+        float(_bo_args.phase_a_mlp_weight) > 0.0
+        or float(_bo_args.phase_a_fwd_weight) > 0.0
+        or float(_bo_args.phase_a_power_weight) > 0.0
+    )
+    if _guided_requested and _bo_args.phase_a_mlp_teacher_ckpt is None:
+        raise ValueError(
+            "Guided Phase-A loss requested (mlp/fwd/power weight > 0) but "
+            "--phase-a-mlp-teacher-ckpt is unset. The schema-2 canonical "
+            "dataset requires the frozen PlainMLP teacher logits column; "
+            "either pass --phase-a-mlp-teacher-ckpt <path/to/dagger_student_plain.pt> "
+            "or set all three guided weights to 0.0 to reproduce the legacy "
+            "Huber-on-flow path."
+        )
+    phase_a_mlp_teacher = None
+    phase_a_mlp_teacher_id = None
+    if _bo_args.phase_a_mlp_teacher_ckpt is not None:
+        from ctle_dagger_common import load_plain_mlp_teacher
+        phase_a_mlp_teacher = load_plain_mlp_teacher(
+            _bo_args.phase_a_mlp_teacher_ckpt, device=DEVICE,
+        )
+        phase_a_mlp_teacher.eval()
+        for _p in phase_a_mlp_teacher.parameters():
+            _p.requires_grad = False
+        _ckpt_path = Path(_bo_args.phase_a_mlp_teacher_ckpt)
+        _ckpt_tag = f"{_ckpt_path.parent.parent.name}/{_ckpt_path.parent.name}/{_ckpt_path.stem}"
+        from ctle_dagger_common import _file_sha256
+        phase_a_mlp_teacher_id = (
+            f"{_ckpt_tag}:{_file_sha256(_bo_args.phase_a_mlp_teacher_ckpt)[:16]}"
+        )
+        _logger.info(f"[phaseA] MLP teacher loaded from "
+                     f"{_bo_args.phase_a_mlp_teacher_ckpt} (id={phase_a_mlp_teacher_id})")
     if _bo_args.prepare_canonical_dataset is not None:
         target_path = Path(_bo_args.prepare_canonical_dataset)
         if target_path.exists() and not _bo_args.canonical_dataset:
@@ -2589,6 +2659,9 @@ if _bo_args.canonical_dataset is not None or _bo_args.prepare_canonical_dataset 
                 seed=int(_bo_args.seed if _bo_args.seed is not None else 100),
                 output_path=target_path,
                 zig_model=zig_model, scaler_X=scaler_X, device=DEVICE,
+                mlp_teacher=phase_a_mlp_teacher,
+                mlp_teacher_id=phase_a_mlp_teacher_id,
+                power_norm=str(_bo_args.phase_a_power_norm),
             )
         if not _bo_args.canonical_dataset:
             _logger.info("[phaseA] --prepare-canonical-dataset set: exiting before training")
@@ -2619,12 +2692,21 @@ if _bo_args.canonical_dataset is not None or _bo_args.prepare_canonical_dataset 
             "input_preprocessing": _bo_args.input_preprocessing or "q75",
             "input_log_min": getattr(student, "input_log_min", None) if hasattr(student, "input_log_min") else None,
             "input_log_max": getattr(student, "input_log_max", None) if hasattr(student, "input_log_max") else None,
+            # Plan phase-a-mlp-guided-knet: MLP-guided 4-term loss wiring.
+            "mlp_weight": float(_bo_args.phase_a_mlp_weight),
+            "fwd_weight": float(_bo_args.phase_a_fwd_weight),
+            "power_weight": float(_bo_args.phase_a_power_weight),
+            "power_norm_const": (
+                float(_bo_args.phase_a_power_norm_const)
+                if _bo_args.phase_a_power_norm_const is not None else None),
         }
         _logger.info(f"[phaseA] canonical-dataset gate engaged: {len(canonical['specs'])} specs, "
                      f"epochs={phase_a_epochs}, batch={ctx_phase_a['batch_size']}, "
                      f"lr={ctx_phase_a['lr']:.2e}, "
                      f"validity_w={ctx_phase_a['validity_weight']:.3f} "
-                     f"ramp=[{ctx_phase_a['validity_ramp_start']}+{ctx_phase_a['validity_ramp_epochs']}]")
+                     f"ramp=[{ctx_phase_a['validity_ramp_start']}+{ctx_phase_a['validity_ramp_epochs']}] "
+                     f"mlp_w={ctx_phase_a['mlp_weight']} fwd_w={ctx_phase_a['fwd_weight']} "
+                     f"power_w={ctx_phase_a['power_weight']}")
         run_phase_a_training(student, ctx_phase_a, model_name="phase_a_moe")
         _logger.info("[phaseA] canonical-dataset gate: training complete; exiting before DAgger body")
         sys.exit(0)
