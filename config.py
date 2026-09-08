@@ -305,7 +305,24 @@ PHYS = {
     "beta_softness": 0.02,
     "clip_current": 0.05,
     "clip_softness": 0.02,
+    # Learnable soft-rail sharpness (F1): the clip denominator ``s`` in
+    #   clip(x) = clip_current * (sigma((x - x_max)/s) - sigma((-x - x_max)/s))
+    # Smaller s = sharper rails. ``clip_sharpness_init`` equals the fixed
+    # ``clip_softness`` so the learnable path is identity-equal at init.
+    # The mapped sharpness lives in [clip_sharpness_min, clip_sharpness_max]
+    # via sigmoid(clip_sharpness_raw) (logit-init so mapped == init).
+    "clip_sharpness_init": 0.02,
+    "clip_sharpness_min": 1e-3,
+    "clip_sharpness_max": 0.2,
 }
+
+# BO search windows for the bounded-sigmoid gm/isat upper rails (F1). These
+# are *search* ranges for kn_bayes_opt only — the build-time defaults stay
+# at ``TANH_REALISTIC_GM_MAX=10.0`` / ``TANH_REALISTIC_ISAT_MAX=10.0`` so
+# non-BO runs and existing checkpoints do not silently change. Param-count
+# neutral: changing gm_max/isat_max adds no tensors.
+BO_GM_MAX_RANGE = (1.0, 50.0)
+BO_ISAT_MAX_RANGE = (1.0, 50.0)
 
 # Reference-edge configuration (unary nonlinearities via OTA-to-Vref plan).
 # Each node gets one OTA edge to a global per-stage Vref voltage. Vref is a

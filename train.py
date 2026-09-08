@@ -1229,7 +1229,9 @@ def make_optimizer(
                 # to the structural LR group (4x base by convention) so the
                 # gate signal can learn alongside z_logits.
                 struct_params.append(p)
-            elif name.endswith(".raw_leak") or name.endswith(".raw_drive_g"):
+            elif (name.endswith(".raw_leak") or name.endswith(".raw_drive_g")
+                  or name.endswith(".clip_sharpness_raw")
+                  or name.startswith("gln_rails.")):
                 dyn_params.append(p)
             else:
                 other_params.append(p)

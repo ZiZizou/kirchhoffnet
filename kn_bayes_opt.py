@@ -458,6 +458,11 @@ def _build_command(
     output: Path,
     device: str,
     boundary_fan_out: dict | None = None,
+    learnable_clip: bool = False,
+    gln_on: bool = False,
+    gln_B: int = 4,
+    gln_rank: int = 2,
+    gln_families: str = "boundary,readout",
 ) -> list[str]:
     if boundary_fan_out is None:
         boundary_fan_out = build_boundary_fan_out(
@@ -506,6 +511,11 @@ def _build_command(
     if problem in EXTRA_FLAGS_FOR_PROBLEM:
         cmd += EXTRA_FLAGS_FOR_PROBLEM[problem]
     cmd += ["--seed", str(seed)]
+    if learnable_clip:
+        cmd += ["--learnable-clip-sharpness"]
+    if gln_on:
+        cmd += ["--gln-rails", "--gln-B", str(gln_B), "--gln-rank", str(gln_rank),
+                "--gln-families", gln_families]
     if problem.startswith("friedman"):
         cmd += ["--target-noise-std", "1.0"]
     return cmd
@@ -719,6 +729,31 @@ def main() -> None:
                         help="Skip enqueueing the START_POINTS seed trial "
                         "(trial 0 explores the search space from a "
                         "random TPE sample instead).")
+    parser.add_argument("--learnable-clip-sharpness", action="store_true",
+                        default=False,
+                        help="Fixed study-level toggle (F1): every trial passes "
+                             "--learnable-clip-sharpness to train_script.py, "
+                             "making the soft-rail clip sharpness a learnable "
+                             "per-stage scalar (adds one trainable param per "
+                             "stage to the feasible-arch budget). Not a sampled "
+                             "dimension: flip it between studies, not trials. "
+                             "Part of the sampling fingerprint.")
+    parser.add_argument("--gln-rails", action="store_true", default=False,
+                        help="Fixed study-level toggle (F2): every trial passes "
+                             "--gln-rails --gln-B .. --gln-rank .. "
+                             "--gln-families .. to train_script.py, adding the "
+                             "shared GLN rails module (boundary + readout-sense "
+                             "log-gm modulation) to the feasible-arch budget. "
+                             "Not a sampled dimension. Requires --readout "
+                             "shared/shared-x2. Part of the sampling fingerprint.")
+    parser.add_argument("--gln-B", type=int, default=4,
+                        help="GLN rail count (default: 4).")
+    parser.add_argument("--gln-rank", type=int, default=2,
+                        help="GLN family edge-mix factorization rank "
+                             "(default: 2).")
+    parser.add_argument("--gln-families", type=str, default="boundary,readout",
+                        help="Comma-separated GLN families (default: "
+                             "boundary,readout).")
     parser.add_argument("--epochs", type=int, default=800,
                         help="Fixed epoch budget per trial (default: 800).")
     parser.add_argument("--n-trials", type=int, default=30)
@@ -1096,6 +1131,11 @@ def main() -> None:
                 moe_experts_choices=(2, 3),
                 moe_gate_rank_choices=(1, 2, 3),
                 require_moe=True,
+                learnable_clip=bool(args.learnable_clip_sharpness),
+                gln_on=bool(args.gln_rails),
+                gln_B=int(args.gln_B),
+                gln_rank=int(args.gln_rank),
+                gln_families=str(args.gln_families),
             )
             bps.require_feasible(knet_ctle_feasible, "CTLE KNet", soft_limit)
             knet_generic_feasible = []
@@ -1112,6 +1152,11 @@ def main() -> None:
                 dagger=False,
                 readout_mode=bo_readout_mode,
                 readout_senses=bo_readout_senses,
+                learnable_clip=bool(args.learnable_clip_sharpness),
+                gln_on=bool(args.gln_rails),
+                gln_B=int(args.gln_B),
+                gln_rank=int(args.gln_rank),
+                gln_families=str(args.gln_families),
             )
             bps.require_feasible(knet_generic_feasible, "KNet", soft_limit)
             knet_ctle_feasible = []
@@ -1153,6 +1198,17 @@ def main() -> None:
         "ctle_phase_a_fwd_weight": float(args.ctle_phase_a_fwd_weight),
         "ctle_phase_a_power_weight": float(args.ctle_phase_a_power_weight),
         "ctle_phase_a_power_norm": str(args.ctle_phase_a_power_norm),
+        # F1: search windows for gm/isat upper rails + the fixed
+        # learnable-clip-sharpness toggle are part of the sampling identity
+        # so stale studies refuse resume when any of them change.
+        "gm_max_range": [float(args.gm_max_min), float(args.gm_max_max)],
+        "isat_max_range": [float(args.isat_max_min), float(args.isat_max_max)],
+        "clip_sharpness_search": bool(args.learnable_clip_sharpness),
+        # F2: GLN schema is fixed per study (flags, not sampled dims).
+        "gln_schema": [
+            bool(args.gln_rails), int(args.gln_B), int(args.gln_rank),
+            str(args.gln_families),
+        ],
     })
 
     # study_was_resumed was captured next to db_path above (pre-create state).
@@ -1688,6 +1744,14 @@ def main() -> None:
             readout=("temporal" if is_seed_trial else args.readout),
             output=trial_dir, device=device,
             boundary_fan_out=seed_boundary_map,
+            learnable_clip=bool(args.learnable_clip_sharpness),
+            # Seed trial always runs the reference temporal config, which
+            # has no shared-sense readout family — GLN (readout family
+            # requires shared_sense) is skipped for the seed anchor only.
+            gln_on=bool(args.gln_rails and not is_seed_trial),
+            gln_B=int(args.gln_B),
+            gln_rank=int(args.gln_rank),
+            gln_families=str(args.gln_families),
         )
         if is_seed_trial:
             trial.set_user_attr("seed_trial", True)

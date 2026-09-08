@@ -793,6 +793,16 @@ def prune_stage(
             "pruner cannot rebuild the sense bank + crossbar); use "
             "readout_mode='ota_mesh' for pruning runs."
         )
+    # GLN rails (F2) are not yet supported by the pruner: the rebuilt stage
+    # would drop the shared rails/edge mixes (owned by the enclosing net)
+    # and silently change behavior. GLN-on-shared is no-prune in v1 — fail
+    # loud instead of silently disabling the modulation.
+    if getattr(stage, "gln_rails", None) is not None:
+        raise ValueError(
+            "prune_stage: GLN rails not yet supported by the pruner (the "
+            "rebuilt stage would drop the shared rails); disable GLN "
+            "(--no-gln-rails) or skip pruning for GLN runs."
+        )
 
     z = stage.edge_gates().detach().cpu()
     # When budget was enabled during training, combine sigmoid * budget gate
@@ -1031,6 +1041,10 @@ def prune_stage(
         x_max=stage.x_max,
         clip_current=stage.clip_current,
         clip_softness=stage.clip_softness,
+        learnable_clip_sharpness=getattr(stage, "_learnable_clip_sharpness", False),
+        clip_sharpness_init=getattr(stage, "clip_sharpness_init", None),
+        clip_sharpness_min=getattr(stage, "clip_sharpness_min", None),
+        clip_sharpness_max=getattr(stage, "clip_sharpness_max", None),
         write_idx=new_write_idx,
         leak_mode=leak_mode,
         leak_constant=leak_constant,
@@ -1101,6 +1115,12 @@ def prune_stage(
             if hasattr(stage, 'raw_leak') and hasattr(new_stage, 'raw_leak'):
                 new_stage.raw_leak.data.copy_(stage.raw_leak.data[node_idx_old].cpu())
             new_stage.u_logits.data.copy_(stage.u_logits.data[node_idx_old].cpu())
+            if (getattr(stage, '_learnable_clip_sharpness', False)
+                    and hasattr(stage, 'clip_sharpness_raw')
+                    and hasattr(new_stage, 'clip_sharpness_raw')):
+                new_stage.clip_sharpness_raw.data.copy_(
+                    stage.clip_sharpness_raw.data.cpu()
+                )
         # Transfer raw_drive_g for surviving driven nodes.
         if new_write_idx is not None and hasattr(stage, 'raw_drive_g'):
             old_drive_idx_list = stage._drive_idx.tolist()
@@ -1313,6 +1333,11 @@ def topology_to_stage(
     x_max: float | None = None,
     clip_current: float | None = None,
     clip_softness: float | None = None,
+    learnable_clip_sharpness: bool = False,
+    clip_sharpness_init: float | None = None,
+    clip_sharpness_min: float | None = None,
+    clip_sharpness_max: float | None = None,
+    gln_rails: "GLNRails | None" = None,
     write_idx: list[int] | None = None,
     leak_mode: str = "programmable",
     leak_constant: float | None = None,
@@ -1638,6 +1663,11 @@ def topology_to_stage(
         x_max=x_max,
         clip_current=clip_current,
         clip_softness=clip_softness,
+        learnable_clip_sharpness=learnable_clip_sharpness,
+        clip_sharpness_init=clip_sharpness_init,
+        clip_sharpness_min=clip_sharpness_min,
+        clip_sharpness_max=clip_sharpness_max,
+        gln_rails=gln_rails,
         write_idx=write_idx,
         leak_mode=leak_mode,
         leak_constant=leak_constant,
@@ -1707,6 +1737,15 @@ def build_net_from_preset(
     vca_bias: bool | None = None,
     x_max: float | None = None,
     c_eff: float | None = None,
+    learnable_clip_sharpness: bool = False,
+    clip_sharpness_init: float | None = None,
+    clip_sharpness_min: float | None = None,
+    clip_sharpness_max: float | None = None,
+    gln_rails: bool = False,
+    gln_B: int = 4,
+    gln_rank: int = 2,
+    gln_alpha_init: float = 1.0,
+    gln_families: str | None = None,
     core_refresh_interval: int = 0,
 ):
     """Build a full KirchhoffNetWithIO from a config.PRESETS entry.
@@ -1846,6 +1885,15 @@ def build_net_from_preset(
         vca_bias=vca_bias,
         x_max=x_max,
         c_eff=c_eff,
+        learnable_clip_sharpness=learnable_clip_sharpness,
+        clip_sharpness_init=clip_sharpness_init,
+        clip_sharpness_min=clip_sharpness_min,
+        clip_sharpness_max=clip_sharpness_max,
+        gln_rails=gln_rails,
+        gln_B=gln_B,
+        gln_rank=gln_rank,
+        gln_alpha_init=gln_alpha_init,
+        gln_families=gln_families,
         core_refresh_interval=core_refresh_interval,
     )
 
@@ -1877,6 +1925,15 @@ def build_net_from_config(
     vca_bias: bool | None = None,
     x_max: float | None = None,
     c_eff: float | None = None,
+    learnable_clip_sharpness: bool = False,
+    clip_sharpness_init: float | None = None,
+    clip_sharpness_min: float | None = None,
+    clip_sharpness_max: float | None = None,
+    gln_rails: bool = False,
+    gln_B: int = 4,
+    gln_rank: int = 2,
+    gln_alpha_init: float = 1.0,
+    gln_families: str | None = None,
     core_refresh_interval: int = 0,
 ):
     """Build a KirchhoffNetWithIO from a full config dict.
@@ -1957,6 +2014,20 @@ def build_net_from_config(
     freeze_read = bool(cfg.get("freeze_read", freeze_read))
     freeze_boundary = bool(cfg.get("freeze_boundary", freeze_boundary))
     freeze_temporal_read = bool(cfg.get("freeze_temporal_read", freeze_temporal_read))
+    # Learnable clip sharpness: cfg dict > explicit kwarg (matches the
+    # freeze_read/freeze_boundary/freeze_temporal_read precedence above).
+    learnable_clip_sharpness = bool(
+        cfg.get("learnable_clip_sharpness", learnable_clip_sharpness)
+    )
+    clip_sharpness_init = cfg.get("clip_sharpness_init", clip_sharpness_init)
+    clip_sharpness_min = cfg.get("clip_sharpness_min", clip_sharpness_min)
+    clip_sharpness_max = cfg.get("clip_sharpness_max", clip_sharpness_max)
+    # GLN rails (F2): cfg dict > explicit kwarg (same precedence).
+    gln_rails = bool(cfg.get("gln_rails", gln_rails))
+    gln_B = int(cfg.get("gln_B", gln_B))
+    gln_rank = int(cfg.get("gln_rank", gln_rank))
+    gln_alpha_init = float(cfg.get("gln_alpha_init", gln_alpha_init))
+    gln_families = cfg.get("gln_families", gln_families)
     if drive_mode not in ("fan_out", "projection"):
         raise ValueError(
             f"drive_mode must be 'fan_out' or 'projection', got {drive_mode!r}"
@@ -2342,6 +2413,59 @@ def build_net_from_config(
                 f"(got write_mode={write_mode!r})"
             )
 
+    # GLN rails (F2): one shared module for the whole net. The rails read the
+    # raw input ``u`` (boundary-terminal voltage vector, width ``in_dim``).
+    # Families are sized from the actual tensors: boundary edges
+    # (``len(boundary_src)``, same flat list for every stage) and readout
+    # sense OTAs (``readout_senses_per_node * n_first_hid``, same width in
+    # every stage — enforced for shared readout). GLN is v1-restricted to
+    # ``tanh_free`` cells (the only family exposing per-edge gm override).
+    gln_module: GLNRails | None = None
+    if gln_rails:
+        from gln_rails import GLNRails
+        if not isinstance(cell_lib, FreeTanhLibrary):
+            raise ValueError(
+                "gln_rails=True requires cell_library='tanh_free' (GLN v1 "
+                "modulates per-edge gm via gm_override, only supported by "
+                f"FreeTanhLibrary, got {type(cell_lib).__name__})"
+            )
+        families = [
+            f.strip() for f in str(gln_families or "boundary,readout").split(",")
+            if f.strip()
+        ]
+        if not families:
+            raise ValueError(
+                "gln_rails=True requires at least one GLN family "
+                "(--gln-families boundary,readout)"
+            )
+        unknown = set(families) - {"boundary", "readout"}
+        if unknown:
+            raise ValueError(
+                f"gln_families supports 'boundary' and 'readout' only, got {unknown}"
+            )
+        gln_module = GLNRails(
+            in_dim=in_dim, B=int(gln_B), rank=int(gln_rank),
+            gm_min=cell_lib.gm_min, gm_max=cell_lib.gm_max,
+            alpha_init=float(gln_alpha_init),
+        )
+        if "boundary" in families:
+            if not enable_boundary:
+                raise ValueError(
+                    "gln_families includes 'boundary' but boundary_fan_out "
+                    "is not configured"
+                )
+            gln_module.add_family("boundary", len(boundary_src))
+        if "readout" in families:
+            if not enable_temporal_readout_effective or readout_mode != "shared_sense":
+                raise ValueError(
+                    "gln_families includes 'readout' but readout_mode is not "
+                    "'shared_sense' (GLN v1 modulates the shared-sense OTA "
+                    "gm, not the ota_mesh mesh)"
+                )
+            gln_module.add_family(
+                "readout", int(readout_senses_per_node) * n_first_hid,
+            )
+
     # Build stages with optional write_idx for persistent drive.
     stage_modules = []
     transfers = []
@@ -2379,6 +2503,11 @@ def build_net_from_config(
             vca_bias=vca_bias_effective,
             x_max=x_max,
             c_eff=c_eff,
+            learnable_clip_sharpness=learnable_clip_sharpness,
+            clip_sharpness_init=clip_sharpness_init,
+            clip_sharpness_min=clip_sharpness_min,
+            clip_sharpness_max=clip_sharpness_max,
+            gln_rails=gln_module,
             core_refresh_interval=core_refresh_interval,
         )
         stage_modules.append(stage)
@@ -2592,6 +2721,7 @@ def build_net_from_config(
         vca_rank=vca_rank_effective,
         vca_in_dim=in_dim,
         vca_bias=vca_bias_effective,
+        gln_rails=gln_module,
     )
 
     # Hard topology check: write_idx → read_idx must be >1 hop on the core

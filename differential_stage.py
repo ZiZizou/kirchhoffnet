@@ -56,6 +56,21 @@ class DifferentialStage(nn.Module):
         x_max: Differential rail limit (default from config).
         clip_current: Soft rail clip current magnitude (default from config).
         clip_softness: Soft rail clip transition width (default from config).
+        learnable_clip_sharpness: When ``True``, the soft-rail clip
+            denominator ``s`` becomes a per-stage learnable scalar
+            (``clip_sharpness_raw``) mapped into
+            ``[clip_sharpness_min, clip_sharpness_max]`` via sigmoid and
+            logit-initialized so the mapped value equals
+            ``clip_sharpness_init`` at startup (epoch-0 forward identical to
+            the fixed path when ``clip_sharpness_init == clip_softness``).
+            When ``False`` (default) ``s`` is the fixed ``clip_softness``
+            float and the forward is bit-identical to the pre-F1 baseline.
+        clip_sharpness_init: Initial mapped sharpness for the learnable
+            path (default from config ``PHYS['clip_sharpness_init']``).
+        clip_sharpness_min: Lower bound of the mapped learnable sharpness
+            (default from config ``PHYS['clip_sharpness_min']``).
+        clip_sharpness_max: Upper bound of the mapped learnable sharpness
+            (default from config ``PHYS['clip_sharpness_max']``).
         write_idx: Indices of hidden nodes that receive persistent bounded
             drive current. When provided, a drive source is created with
             learnable per-node conductance ``raw_drive_g``. ``None`` disables
@@ -183,6 +198,11 @@ class DifferentialStage(nn.Module):
         x_max: float | None = None,
         clip_current: float | None = None,
         clip_softness: float | None = None,
+        learnable_clip_sharpness: bool = False,
+        clip_sharpness_init: float | None = None,
+        clip_sharpness_min: float | None = None,
+        clip_sharpness_max: float | None = None,
+        gln_rails: "GLNRails | None" = None,
         write_idx: list[int] | None = None,
         drive_isat: float | None = None,
         leak_mode: str = "programmable",
@@ -252,6 +272,50 @@ output_ode_src: list[int] | None = None,
         self.x_max = float(x_max if x_max is not None else PHYS["x_max"])
         self.clip_current = float(clip_current if clip_current is not None else PHYS["clip_current"])
         self.clip_softness = float(clip_softness if clip_softness is not None else PHYS["clip_softness"])
+        # Learnable soft-rail sharpness (F1): one scalar per stage. Off-path
+        # (default) keeps the fixed ``clip_softness`` float so the rhs is
+        # bit-identical to the pre-F1 baseline. On-path maps
+        # ``clip_sharpness_raw`` via sigmoid into
+        # ``[clip_sharpness_min, clip_sharpness_max]``, logit-initialized so
+        # the mapped value equals ``clip_sharpness_init`` at startup.
+        self._learnable_clip_sharpness = bool(learnable_clip_sharpness)
+        self.clip_sharpness_init = float(
+            clip_sharpness_init if clip_sharpness_init is not None
+            else PHYS["clip_sharpness_init"]
+        )
+        self.clip_sharpness_min = float(
+            clip_sharpness_min if clip_sharpness_min is not None
+            else PHYS["clip_sharpness_min"]
+        )
+        self.clip_sharpness_max = float(
+            clip_sharpness_max if clip_sharpness_max is not None
+            else PHYS["clip_sharpness_max"]
+        )
+        if self.clip_sharpness_max <= self.clip_sharpness_min:
+            raise ValueError(
+                f"clip_sharpness_max must be > clip_sharpness_min, got "
+                f"[{self.clip_sharpness_min}, {self.clip_sharpness_max}]"
+            )
+        if self._learnable_clip_sharpness:
+            t = (self.clip_sharpness_init - self.clip_sharpness_min) / (
+                self.clip_sharpness_max - self.clip_sharpness_min
+            )
+            t = float(min(max(t, 1e-4), 1.0 - 1e-4))
+            raw0 = math.log(t / (1.0 - t))
+            self.clip_sharpness_raw = nn.Parameter(
+                torch.tensor(raw0, dtype=torch.float32)
+            )
+        else:
+            # Fixed path: no parameter, no buffer — the float stays in
+            # ``self.clip_softness`` (kept for backward compat with the
+            # pre-F1 rhs and state_dicts).
+            self.clip_sharpness_raw = None
+        # GLN rails (F2): one shared GLNRails module for the whole net,
+        # owned/registered by the enclosing KirchhoffNetWithIO (never here).
+        # Stored as a plain attribute (bypassing nn.Module auto-registration)
+        # so stage.parameters()/state_dict() do not duplicate the shared
+        # tensors across stages. ``None`` disables GLN (default).
+        object.__setattr__(self, "gln_rails", gln_rails)
 
         if len(src) != len(dst):
             raise ValueError(f"src/dst length mismatch: {len(src)} vs {len(dst)}")
@@ -933,7 +997,18 @@ output_ode_src: list[int] | None = None,
         u_src0 = u[:, self.boundary_src]
         x_dst0 = x0[:, self.boundary_dst]
         cell_lib = self.boundary_cell_lib
-        if hasattr(cell_lib, "forward_tanh"):
+        gln_rails = getattr(self, "gln_rails", None)
+        if gln_rails is not None and "boundary" in gln_rails.families:
+            # GLN (F2): fold the input-conditioned gm modulation into the
+            # frozen tensor exactly like the dynamic path (tanh with
+            # modulated gm; resistive shunt stays dynamic in rhs).
+            gm0_b = cell_lib.current_gm()
+            gm_b = gln_rails.modulate_gm(gm0_b, u, "boundary")
+            i_edge = cell_lib.forward_tanh(
+                x_src=u_src0, x_dst=x_dst0, x_max=self.x_max,
+                gm_override=gm_b,
+            )
+        elif hasattr(cell_lib, "forward_tanh"):
             i_edge = cell_lib.forward_tanh(
                 x_src=u_src0, x_dst=x_dst0, x_max=self.x_max,
             )
@@ -1023,7 +1098,17 @@ output_ode_src: list[int] | None = None,
         # FreeTanh ``x_dst`` argument so the cell is reused exactly.
         vref = torch.sigmoid(self.raw_vref_sense) * self.x_max
         x_dst0 = vref.to(x0.dtype).view(1, 1).expand_as(x_src0)
-        if hasattr(cell_lib, "forward_tanh"):
+        gln_rails = getattr(self, "gln_rails", None)
+        if gln_rails is not None and u is not None and "readout" in gln_rails.families:
+            # GLN (F2): fold the input-conditioned sense-gm modulation into
+            # the frozen per-sense currents (crossbar W stays untouched).
+            gm0_s = cell_lib.current_gm()
+            gm_s = gln_rails.modulate_gm(gm0_s, u, "readout")
+            i_edge = cell_lib.forward_tanh(
+                x_src=x_src0, x_dst=x_dst0, x_max=self.x_max,
+                gm_override=gm_s,
+            )
+        elif hasattr(cell_lib, "forward_tanh"):
             i_edge = cell_lib.forward_tanh(
                 x_src=x_src0, x_dst=x_dst0, x_max=self.x_max,
             )
@@ -1087,6 +1172,33 @@ output_ode_src: list[int] | None = None,
         if not self.read_only_source:
             acc_const.index_add_(1, self.src, -i_edge_f32)
         return acc_const.to(dtype=x_src_state.dtype)
+
+    def clip_sharpness(self) -> float | torch.Tensor:
+        """Live soft-rail clip sharpness ``s`` (denominator of the sigmoid rails).
+
+        Returns the fixed ``clip_softness`` float on the off-path (default,
+        bit-identical to the pre-F1 baseline) or the sigmoid-mapped
+        ``clip_sharpness_raw`` scalar in ``[clip_sharpness_min,
+        clip_sharpness_max]`` on the learnable path.
+        """
+        if self._learnable_clip_sharpness and self.clip_sharpness_raw is not None:
+            t = torch.sigmoid(self.clip_sharpness_raw)
+            return self.clip_sharpness_min + (
+                self.clip_sharpness_max - self.clip_sharpness_min
+            ) * t
+        return self.clip_softness
+
+    def soft_clip(self, x: torch.Tensor) -> torch.Tensor:
+        """Soft-rail clip current ``clip_current * (sigma - sigma)`` with live sharpness.
+
+        ``clip(x) = clip_current * (sigma((x - x_max)/s) - sigma((-x - x_max)/s))``
+        with ``s = self.clip_sharpness()`` (fixed ``clip_softness`` float on
+        the default path, learnable per-stage scalar on the F1 path).
+        """
+        s = self.clip_sharpness()
+        clip = torch.sigmoid((x - self.x_max) / s)
+        clip = clip - torch.sigmoid((-x - self.x_max) / s)
+        return self.clip_current * clip
 
     def rhs(self, x: torch.Tensor,
             u: torch.Tensor | None = None,
@@ -1156,6 +1268,16 @@ output_ode_src: list[int] | None = None,
         """
         x_src = x[:, self.src]
         x_dst = x[:, self.dst]
+
+        # GLN rails (F2): compute the rail activations once per stage entry
+        # (u is constant per sample during the ODE integration) and reuse
+        # them for every gated family below. GLN modulates gm *inside* the
+        # tanh argument; VCA (when on) multiplies the resulting current
+        # *outside*, so both compose without double-applying.
+        gln_z = None
+        gln_rails = getattr(self, "gln_rails", None)
+        if gln_rails is not None and u is not None:
+            gln_z = gln_rails.rails(u)  # [B, n_rails]
 
         # Edge gate: multiply each edge's current by its gate. Computed once
         # here and reused for both the tanh current and the resistive shunt
@@ -1235,9 +1357,23 @@ output_ode_src: list[int] | None = None,
             boundary_mask = torch.sigmoid(self.boundary_z_logits)  # [Eb]
             if i_boundary_const is None:
                 # Dynamic path: full cell forward (tanh + resistive shunt).
-                i_boundary = self.boundary_cell_lib(
-                    x_src=u_src, x_dst=x_dst_b, x_max=self.x_max,
-                )
+                # GLN (F2): modulate the family's gm with the shared rails
+                # (gm inside tanh arg); the resistive shunt is never gated.
+                if gln_z is not None and "boundary" in gln_rails.families:
+                    gm0_b = self.boundary_cell_lib.current_gm()        # [Eb]
+                    gm_b = gln_rails.modulate_gm_z(
+                        gm0_b, gln_z, "boundary",
+                    )                                                  # [B, Eb]
+                    i_boundary = self.boundary_cell_lib.forward_tanh(
+                        x_src=u_src, x_dst=x_dst_b, x_max=self.x_max,
+                        gm_override=gm_b,
+                    ) + self.boundary_cell_lib.resistive_current(
+                        u_src, x_dst_b,
+                    )
+                else:
+                    i_boundary = self.boundary_cell_lib(
+                        x_src=u_src, x_dst=x_dst_b, x_max=self.x_max,
+                    )
                 i_boundary = i_boundary * boundary_mask.unsqueeze(0)   # [B, Eb]
                 if self.vca_enabled and self.vca_v_boundary is not None:
                     i_boundary = i_boundary * self._compute_vca_gate(
@@ -1363,9 +1499,23 @@ output_ode_src: list[int] | None = None,
             x_dst_s = vref.view(1, 1).expand_as(x_j)
             if i_readout_const is None:
                 # Dynamic path: full cell forward (tanh + resistive shunt).
-                i_s = self.readout_sense_cell_lib(
-                    x_src=x_j, x_dst=x_dst_s, x_max=self.x_max,
-                )
+                # GLN (F2): modulate the sense OTA gm with the shared rails
+                # (one gm per sense; the crossbar W is never touched by GLN).
+                if gln_z is not None and "readout" in gln_rails.families:
+                    gm0_s = self.readout_sense_cell_lib.current_gm()  # [n_sense]
+                    gm_s = gln_rails.modulate_gm_z(
+                        gm0_s, gln_z, "readout",
+                    )                                                  # [B, n_sense]
+                    i_s = self.readout_sense_cell_lib.forward_tanh(
+                        x_src=x_j, x_dst=x_dst_s, x_max=self.x_max,
+                        gm_override=gm_s,
+                    ) + self.readout_sense_cell_lib.resistive_current(
+                        x_j, x_dst_s,
+                    )
+                else:
+                    i_s = self.readout_sense_cell_lib(
+                        x_src=x_j, x_dst=x_dst_s, x_max=self.x_max,
+                    )
                 i_s = i_s * sense_mask.unsqueeze(0)        # [B, n_sense]
                 if self.vca_enabled and self.vca_v_readout is not None and u is not None:
                     i_s = i_s * self._compute_vca_gate(
@@ -1406,9 +1556,7 @@ output_ode_src: list[int] | None = None,
         leak = self._effective_leak(leak_floor=leak_floor).unsqueeze(0).to(x.device)  # [1, N]
         leak_term = leak * x
 
-        clip = torch.sigmoid((x - self.x_max) / self.clip_softness)
-        clip = clip - torch.sigmoid((-x - self.x_max) / self.clip_softness)
-        clip_term = self.clip_current * clip
+        clip_term = self.soft_clip(x)
 
         i_drive = self.drive_current(x, x_drive, drive_scale)
         return (acc + i_drive - leak_term - clip_term) / self.c_eff

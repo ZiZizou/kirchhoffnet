@@ -59,7 +59,7 @@ def format_parameter_breakdown(breakdown: dict) -> str:
     stage_label_w = max(stage_label_w, 8)
     width = max(label_w + 18, stage_label_w + 18, 30)
     lines: list[str] = []
-    for name in ("input_mapper", "output_mapper", "drive_mappers", "skip_linear"):
+    for name in ("input_mapper", "output_mapper", "drive_mappers", "skip_linear", "gln_rails"):
         if groups.get(name, 0) or name in ("input_mapper", "output_mapper", "drive_mappers"):
             lines.append(f"  {name:<{label_w}}: {groups.get(name, 0):>{width - label_w - 4}}")
     for stage_key in sorted(per_stage.keys()):
@@ -254,6 +254,7 @@ class KirchhoffNetWithIO(nn.Module):
         vca_rank: int | None = None,
         vca_in_dim: int | None = None,
         vca_bias: bool | None = None,
+        gln_rails: "GLNRails | None" = None,
     ) -> None:
         super().__init__()
         if hid_count < 0 or proj_count < 0:
@@ -388,6 +389,11 @@ class KirchhoffNetWithIO(nn.Module):
         self.enable_vca = bool(enable_vca)
         self.vca_rank = int(vca_rank) if vca_rank is not None else 0
         self.vca_in_dim = int(vca_in_dim) if vca_in_dim is not None else 0
+        # GLN rails (F2): one shared module for the whole net, registered
+        # here (single ownership). Stages hold a plain (non-registered)
+        # reference so the shared tensors are counted exactly once by
+        # ``net.parameters()`` / ``net.state_dict()``.
+        self.gln_rails = gln_rails
         # Stored for topology/API compatibility; per-edge VCA biases are
         # owned and applied by DifferentialStage instances.
         self.vca_bias = vca_bias
@@ -515,7 +521,10 @@ class KirchhoffNetWithIO(nn.Module):
                 deq_cfg=deq_cfg,
                 stage_noise_std=stage_noise_std,
                 stage_noise_generator=stage_noise_generator,
-                u=u if (self.enable_boundary or self.enable_vca) else None,
+                u=u if (
+                    self.enable_boundary or self.enable_vca
+                    or self.gln_rails is not None
+                ) else None,
             )
         if self.read_idx is not None:
             x_read = x_final
@@ -566,6 +575,7 @@ class KirchhoffNetWithIO(nn.Module):
             "post_readout_transfer": 0,
             "drive_mappers": 0,
             "skip_linear": 0,
+            "gln_rails": 0,
         }
         per_stage: dict[str, dict[str, int]] = {}
         total = 0
@@ -584,6 +594,8 @@ class KirchhoffNetWithIO(nn.Module):
                 groups["drive_mappers"] += n
             elif name.startswith("skip_linear"):
                 groups["skip_linear"] += n
+            elif name.startswith("gln_rails"):
+                groups["gln_rails"] += n
             elif name.startswith("core.stages."):
                 parts = name.split(".")
                 if len(parts) < 4:

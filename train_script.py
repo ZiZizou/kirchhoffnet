@@ -1995,7 +1995,9 @@ def compute_update_norms(
             or name.endswith(".vca_v_core")
         ):
             g = "struct"
-        elif name.endswith(".raw_leak") or name.endswith(".raw_drive_g"):
+        elif (name.endswith(".raw_leak") or name.endswith(".raw_drive_g")
+              or name.endswith(".clip_sharpness_raw")
+              or name.startswith("gln_rails.")):
             g = "dyn"
         else:
             g = "other"
@@ -2208,6 +2210,17 @@ def _add_argparse_args(parser: argparse.ArgumentParser) -> None:
              "Scales the ODE integration: dx_j/dt = (ΣI - leak - clip) / C_eff. "
              "kn-bayes-opt uses this as an optimization dimension.")
     parser.add_argument(
+        "--learnable-clip-sharpness", action="store_true",
+        dest="learnable_clip_sharpness",
+        help="Make the soft-rail clip sharpness ``s`` a learnable per-stage "
+             "scalar (F1). Off by default: the clip denominator stays the "
+             "fixed config clip_softness=0.02 and the forward is bit-identical "
+             "to the pre-F1 baseline. When on, ``s = clip_sharpness_min + "
+             "(clip_sharpness_max - clip_sharpness_min) * sigmoid("
+             "clip_sharpness_raw)`` per stage, logit-initialized so the mapped "
+             "value equals --clip-sharpness-init at startup. Adds one trainable "
+             "parameter per stage (param count N0 + num_stages).")
+    parser.add_argument(
         "--x-max", type=float, default=None, dest="x_max",
         help="Differential rail limit x_max for stage ODE states and the "
              "input/output mappers (default: config PHYS['x_max']=3.0). "
@@ -2401,6 +2414,49 @@ def _add_argparse_args(parser: argparse.ArgumentParser) -> None:
              "and fixed-point conditioning, so boosting aggressively can "
              "destabilize DEQ solves. When != 1.0, uses flat global groups "
              "and ignores --stage-lr-scale.")
+    parser.add_argument(
+        "--gln-rails", action="store_true", dest="gln_rails",
+        help="Enable GLN rails (F2): one shared input-conditioned module of "
+             "B tanh half-spaces modulating log-gm on the boundary and "
+             "readout-sense OTA families (gm inside the tanh arg; VCA still "
+             "multiplies the current outside). Off by default (identity: "
+             "zero-initialized edge mix -> gm = gm0 exactly). Requires "
+             "--cell-library tanh_free and --readout shared/shared-x2. Core "
+             "edges and resistive shunts are never gated.")
+    parser.add_argument(
+        "--gln-B", type=int, default=4, dest="gln_B",
+        help="Number of GLN tanh half-space rails (default: 4).")
+    parser.add_argument(
+        "--gln-rank", type=int, default=2, dest="gln_rank",
+        help="Factorization rank of each GLN family's edge mix P@Q "
+             "(default: 2; params per family = E*rank + rank*B).")
+    parser.add_argument(
+        "--gln-alpha-init", type=float, default=1.0, dest="gln_alpha_init",
+        help="Initial rail steepness before the softplus map (default: 1.0). "
+             "a/c start at zero so rails output z~=0 at init regardless.")
+    parser.add_argument(
+        "--gln-families", type=str, default="boundary,readout",
+        dest="gln_families",
+        help="Comma-separated GLN families (default: boundary,readout). Only "
+             "'boundary' and 'readout' (shared-sense OTAs) are supported in "
+             "v1; core edges and resistive shunts are never gated.")
+    parser.add_argument(
+        "--clip-sharpness-init", type=float, default=None,
+        dest="clip_sharpness_init",
+        help="Initial mapped sharpness for --learnable-clip-sharpness "
+             "(default: config PHYS['clip_sharpness_init']=0.02). "
+             "Logit-inverted so epoch-0 equals this value exactly.")
+    parser.add_argument(
+        "--clip-sharpness-min", type=float, default=None,
+        dest="clip_sharpness_min",
+        help="Lower bound of the mapped learnable clip sharpness "
+             "(default: config PHYS['clip_sharpness_min']=1e-3).")
+    parser.add_argument(
+        "--clip-sharpness-max", type=float, default=None,
+        dest="clip_sharpness_max",
+        help="Upper bound of the mapped learnable clip sharpness "
+             "(default: config PHYS['clip_sharpness_max']=0.2). "
+             "Must be > --clip-sharpness-min.")
     parser.add_argument(
         "--freeze-mappers", dest="freeze_mappers", action="store_true", default=False,
         help="Freeze mapper requires_grad during the first half of the combined "
@@ -3656,7 +3712,16 @@ def main():
         vca_gate_shunt=args.vca_gate_shunt,
         vca_separate_core_bus=args.vca_separate_core_bus,
         x_max=args.x_max,
-        c_eff=args.c_eff)
+        c_eff=args.c_eff,
+        learnable_clip_sharpness=args.learnable_clip_sharpness,
+        clip_sharpness_init=args.clip_sharpness_init,
+        clip_sharpness_min=args.clip_sharpness_min,
+        clip_sharpness_max=args.clip_sharpness_max,
+        gln_rails=args.gln_rails,
+        gln_B=args.gln_B,
+        gln_rank=args.gln_rank,
+        gln_alpha_init=args.gln_alpha_init,
+        gln_families=args.gln_families)
     net.to(device)
 
     if args.no_edge_gates:

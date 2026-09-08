@@ -313,22 +313,47 @@ class FreeTanhLibrary(nn.Module):
 
         self._beta_softness = float(PHYS["beta_softness"])
 
-    def _tanh_core(self, x_src: torch.Tensor, x_dst: torch.Tensor) -> torch.Tensor:
+    def current_gm(self) -> torch.Tensor:
+        """Current gm values ``[E]`` from the bounded sigmoid map.
+
+        This is the GLN *base* ``gm0``: the static gm the cell would use
+        without rails. GLN multiplies it by ``exp(delta)`` and re-clamps to
+        ``[gm_min, gm_max]`` (see ``gln_rails.GLNRails``).
+        """
+        sig_gm = torch.sigmoid(self.gm_raw)
+        return self.gm_min + (self.gm_max - self.gm_min) * sig_gm        # [E]
+
+    def _tanh_core(
+        self,
+        x_src: torch.Tensor,
+        x_dst: torch.Tensor,
+        gm_override: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         """Internal: leaky-tanh current (no compliance gating).
 
-        Returns ``I_sat * (tanh(u) + ALPHA * u)`` with shape ``[1, E]`` —
+        Returns ``I_sat * (tanh(u) + ALPHA * u)`` with shape ``[B, E]`` —
         broadcastable against ``x_src``/``x_dst`` which are ``[B, E]``.
+
+        ``gm_override`` (GLN path): caller-supplied modulated gm, shape
+        ``[B, E]`` (or ``[1, E]``), used instead of the static sigmoid map.
+        The stage calls this with the GLN-modulated gm for boundary /
+        readout-sense families only; the core family always uses the static
+        map (GLN never touches core edges in v1).
         """
         A = torch.nn.functional.softplus(self.a_raw).unsqueeze(0)        # [1, E]
         B = torch.nn.functional.softplus(self.b_raw).unsqueeze(0)        # [1, E]
         s = torch.sign(self.s_raw)                                       # [E]
         s_ste = s + self.s_raw - self.s_raw.detach()                     # STE: [E]
-        sig_gm = torch.sigmoid(self.gm_raw)
-        gm = self.gm_min + (self.gm_max - self.gm_min) * sig_gm          # [E]
+        if gm_override is not None:
+            gm = gm_override                                             # [B, E] or [1, E]
+        else:
+            sig_gm = torch.sigmoid(self.gm_raw)
+            gm = self.gm_min + (self.gm_max - self.gm_min) * sig_gm      # [E]
+            gm = gm.unsqueeze(0)                                         # [1, E]
         sig_isat = torch.sigmoid(self.isat_raw)
         isat = (self.isat_min + (self.isat_max - self.isat_min) * sig_isat).clamp_min(1e-6)  # [E]
         theta = self.theta_raw.unsqueeze(0) if self._bias_enabled else 0.0
-        u = (s_ste.unsqueeze(0) * (A * x_src - B * x_dst) + theta) * gm.unsqueeze(0)
+        u = (s_ste.unsqueeze(0) * (A * x_src - B * x_dst) + theta) * gm
         return isat.unsqueeze(0) * (torch.tanh(u) + self.ALPHA * u)
 
     def forward_tanh(
@@ -336,14 +361,19 @@ class FreeTanhLibrary(nn.Module):
         x_src: torch.Tensor,
         x_dst: torch.Tensor,
         x_max: float,
+        gm_override: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Leaky-tanh current with compliance gating, no resistive shunt.
 
         Use this when the resistive term must be excluded (e.g. ``--freeze-read``
         wants to freeze only the tanh contribution at ``x0``).
         Returns ``[batch, E]`` gated by ``gate_src * gate_dst``.
+
+        ``gm_override`` (GLN path): modulated gm ``[B, E]`` from
+        :meth:`GLNRails.modulate_gm_z`, used instead of the static sigmoid
+        map (see :meth:`_tanh_core`).
         """
-        i_cell = self._tanh_core(x_src, x_dst)                          # [1, E]
+        i_cell = self._tanh_core(x_src, x_dst, gm_override=gm_override)  # [1, E] or [B, E]
         if self._parallel_tanh_mult_enabled:
             sig_gm_x = torch.sigmoid(self.gm_x_raw)
             gm_x = self.gm_min + (self.gm_max - self.gm_min) * sig_gm_x # [E]

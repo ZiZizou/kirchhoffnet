@@ -218,14 +218,21 @@ def _knet_param_count_cached(num_hidden: int, num_stages: int,
                              fanout_count: int, use_robust_input: bool,
                              moe_num_experts: int, moe_gate_rank: int,
                              dagger: bool, readout_mode: str = "ota_mesh",
-                             readout_senses: int = 1) -> int:
+                             readout_senses: int = 1,
+                             learnable_clip: bool = False,
+                             gln_on: bool = False, gln_B: int = 4,
+                             gln_rank: int = 2,
+                             gln_families: str = "boundary,readout") -> int:
     """Exact KNet trainable-param count by building the net (no training).
 
     The count depends on hidden, stages, k, rank AND fanout for the generic
     path (empirically verified: friedman2 h25/st5 k4->7061, k6->9561,
     rank4->8471, fanout1->6973), so the tuple is cached in full. t_span,
     num_steps, x_max, gm/isat, lr/wd/batch and freeze flags never move the
-    count.
+    count. ``learnable_clip`` (F1) adds one ``clip_sharpness_raw`` scalar per
+    stage; ``gln_on``/``gln_B``/``gln_rank``/``gln_families`` (F2) add the
+    shared rails + per-family edge mixes. Both are part of the cache key so
+    feasible-architecture lists never go stale when BO flags flip.
 
     ``dagger=True`` reproduces the CTLE dagger harness construction
     (fixed-distillation pattern); ``dagger=False`` reproduces the generic
@@ -288,7 +295,15 @@ def _knet_param_count_cached(num_hidden: int, num_stages: int,
         readout_senses_per_node=int(readout_senses),
         vca_enabled=True, vca_rank=vca_rank, vca_core_enabled=True,
         vca_gate_shunt=False, vca_separate_core_bus=True, vca_bias=False,
+        learnable_clip_sharpness=bool(learnable_clip),
+        gln_rails=bool(gln_on),
+        gln_B=int(gln_B),
+        gln_rank=int(gln_rank),
+        gln_families=str(gln_families),
     )
+    # F1/F2: the build above already counts the per-stage clip_sharpness_raw
+    # scalars and the shared GLN module when the flags are on; the flags are
+    # part of the cache key so the count can never be served stale.
     return sum(p.numel() for p in net.parameters() if p.requires_grad)
 
 
@@ -297,13 +312,17 @@ def knet_param_count(num_hidden: int, num_stages: int, small_world_k: int,
                      fanout_count: int = 2, use_robust_input: bool = False,
                      moe_num_experts: int = 0, moe_gate_rank: int = 0,
                      dagger: bool = False, readout_mode: str = "ota_mesh",
-                     readout_senses: int = 1) -> int:
+                     readout_senses: int = 1, learnable_clip: bool = False,
+                     gln_on: bool = False, gln_B: int = 4,
+                     gln_rank: int = 2,
+                     gln_families: str = "boundary,readout") -> int:
     """Public wrapper around the cached build-based KNet count."""
     return _knet_param_count_cached(
         int(num_hidden), int(num_stages), int(small_world_k), int(vca_rank),
         int(in_dim), int(out_dim), int(fanout_count), bool(use_robust_input),
         int(moe_num_experts), int(moe_gate_rank), bool(dagger),
-        readout_mode, int(readout_senses),
+        readout_mode, int(readout_senses), bool(learnable_clip),
+        bool(gln_on), int(gln_B), int(gln_rank), str(gln_families),
     )
 
 
@@ -320,6 +339,11 @@ def knet_feasible_arches(*, soft_limit: int, in_dim: int, out_dim: int,
                          dagger: bool = False,
                          readout_mode: str = "ota_mesh",
                          readout_senses: int = 1,
+                         learnable_clip: bool = False,
+                         gln_on: bool = False,
+                         gln_B: int = 4,
+                         gln_rank: int = 2,
+                         gln_families: str = "boundary,readout",
                          moe_experts_choices: tuple[int, ...] = (),
                          moe_gate_rank_choices: tuple[int, ...] = (),
                          require_moe: bool = False) -> list[tuple]:
@@ -337,7 +361,8 @@ def knet_feasible_arches(*, soft_limit: int, in_dim: int, out_dim: int,
     """
     key = (soft_limit, in_dim, out_dim, hidden_range, stages_range,
            k_choices, rank_range, fanout_choices, use_robust_input,
-           dagger, readout_mode, int(readout_senses),
+           dagger, readout_mode, int(readout_senses), bool(learnable_clip),
+           bool(gln_on), int(gln_B), int(gln_rank), str(gln_families),
            moe_experts_choices, moe_gate_rank_choices, require_moe)
     if key in _knet_feasible_cache:
         return _knet_feasible_cache[key]
@@ -370,7 +395,11 @@ def knet_feasible_arches(*, soft_limit: int, in_dim: int, out_dim: int,
                                             moe_gate_rank=gate_rank,
                                             dagger=True,
                                             readout_mode=readout_mode,
-                                            readout_senses=readout_senses)
+                                            readout_senses=readout_senses,
+                                            learnable_clip=learnable_clip,
+                                            gln_on=gln_on, gln_B=gln_B,
+                                            gln_rank=gln_rank,
+                                            gln_families=gln_families)
                                     except Exception:
                                         continue
                                     if p <= soft_limit:
@@ -388,7 +417,11 @@ def knet_feasible_arches(*, soft_limit: int, in_dim: int, out_dim: int,
                                     use_robust_input=use_robust_input,
                                     dagger=False,
                                     readout_mode=readout_mode,
-                                    readout_senses=readout_senses)
+                                    readout_senses=readout_senses,
+                                    learnable_clip=learnable_clip,
+                                    gln_on=gln_on, gln_B=gln_B,
+                                    gln_rank=gln_rank,
+                                    gln_families=gln_families)
                             except Exception:
                                 continue
                             if p <= soft_limit:
