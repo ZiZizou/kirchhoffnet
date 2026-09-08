@@ -2433,7 +2433,8 @@ def _add_argparse_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--gln-alpha-init", type=float, default=1.0, dest="gln_alpha_init",
         help="Initial rail steepness before the softplus map (default: 1.0). "
-             "a/c start at zero so rails output z~=0 at init regardless.")
+             "a starts at N(0, 0.01) and c at 0; identity (gm=gm0) is "
+             "carried by the zero-initialized edge mix P@Q, not by z.")
     parser.add_argument(
         "--gln-families", type=str, default="boundary,readout",
         dest="gln_families",

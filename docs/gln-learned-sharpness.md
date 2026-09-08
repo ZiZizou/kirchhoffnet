@@ -1,9 +1,11 @@
 # F1 + F2 implementation note — learnable clip sharpness + GLN rails
 
-Status: implemented on `feat/gm-bounds-gln-rails` (plan
-`docs/GLN_learned_sharpness.md`). Both features default **off**, so
-non-flag runs keep the exact pre-feature behavior (verified: param count
-`N0` and epoch-0 forward unchanged, see below).
+Status: implemented on `feat/gm-bounds-gln-rails`. This note is the
+implementation companion to the plan at
+`docs/GLN_learned_sharpness.md` (the plan is the authoritative spec). Both
+features default **off**, so non-flag runs keep the exact pre-feature
+behavior (verified: param count `N0` and epoch-0 forward unchanged, see
+below).
 
 ## F1 — learnable per-stage clip sharpness
 
@@ -49,9 +51,15 @@ per family e:  delta_e = (P @ Q)[e, :] . z        # P [E, rank], Q [rank, B]
 
 - `gm0` = the cell library's static bounded-sigmoid gm
   (`FreeTanhLibrary.current_gm`).
-- **Identity init (load-bearing):** `P = Q = 0` ⇒ `delta = 0` ⇒ `gm = gm0`
-  exactly (`exp(0) = 1`), so GLN-on at init == GLN-off forward
+- **Identity init (load-bearing):** `W = P @ Q = 0` ⇒ `delta = 0` ⇒
+  `gm = gm0` exactly (`exp(0) = 1`), so GLN-on at init == GLN-off forward
   (verified on the Phase-0 arch: max abs diff `0.0`).
+- **Asymmetric init (anti dead-saddle):** `a` and `P` are drawn from
+  `N(0, 0.01)` while `c = 0` and `Q = 0`. `W` stays exactly zero (identity),
+  but `d(gm)/dQ = P·z ≠ 0` gives Q a nonzero gradient on step 0; once Q
+  moves, `W ≠ 0` and `P`/`a`/`c`/`alpha` all receive signal. Zeroing both
+  `z` and `W` would make every GLN gradient exactly zero forever (F2 would
+  silently train as if absent).
 - **Families:** `boundary` (boundary OTAs, E = `len(boundary_src)`) and
   `readout` (shared-sense OTAs, E = `readout_senses_per_node ×
   num_hidden`). Core hidden edges and resistive shunts are **never** gated.

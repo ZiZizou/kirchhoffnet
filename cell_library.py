@@ -375,6 +375,12 @@ class FreeTanhLibrary(nn.Module):
         """
         i_cell = self._tanh_core(x_src, x_dst, gm_override=gm_override)  # [1, E] or [B, E]
         if self._parallel_tanh_mult_enabled:
+            # NOTE (GLN): the parallel tanh-multiplier branch has its OWN
+            # per-edge gm_x/gm_y parameters (independent of the OTA gm the
+            # GLN modulates), so ``gm_override`` intentionally applies to the
+            # main OTA path only. PARALLEL_TANH_MULT_ENABLED defaults False
+            # and is not used by GLN configs (tanh_free core without the
+            # parallel multiplier); revisit if the branch is ever gated.
             sig_gm_x = torch.sigmoid(self.gm_x_raw)
             gm_x = self.gm_min + (self.gm_max - self.gm_min) * sig_gm_x # [E]
             sig_gm_y = torch.sigmoid(self.gm_y_raw)

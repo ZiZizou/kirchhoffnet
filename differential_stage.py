@@ -1001,9 +1001,11 @@ output_ode_src: list[int] | None = None,
         if gln_rails is not None and "boundary" in gln_rails.families:
             # GLN (F2): fold the input-conditioned gm modulation into the
             # frozen tensor exactly like the dynamic path (tanh with
-            # modulated gm; resistive shunt stays dynamic in rhs).
+            # modulated gm; resistive shunt stays dynamic in rhs). Rails are
+            # computed once here (u is constant for the whole stage entry).
             gm0_b = cell_lib.current_gm()
-            gm_b = gln_rails.modulate_gm(gm0_b, u, "boundary")
+            gln_z = gln_rails.rails(u)
+            gm_b = gln_rails.modulate_gm_z(gm0_b, gln_z, "boundary")
             i_edge = cell_lib.forward_tanh(
                 x_src=u_src0, x_dst=x_dst0, x_max=self.x_max,
                 gm_override=gm_b,
@@ -1102,8 +1104,10 @@ output_ode_src: list[int] | None = None,
         if gln_rails is not None and u is not None and "readout" in gln_rails.families:
             # GLN (F2): fold the input-conditioned sense-gm modulation into
             # the frozen per-sense currents (crossbar W stays untouched).
+            # Rails computed once (u constant per stage entry).
             gm0_s = cell_lib.current_gm()
-            gm_s = gln_rails.modulate_gm(gm0_s, u, "readout")
+            gln_z = gln_rails.rails(u)
+            gm_s = gln_rails.modulate_gm_z(gm0_s, gln_z, "readout")
             i_edge = cell_lib.forward_tanh(
                 x_src=x_src0, x_dst=x_dst0, x_max=self.x_max,
                 gm_override=gm_s,

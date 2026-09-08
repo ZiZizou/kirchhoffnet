@@ -10,11 +10,17 @@ modulation:
     delta_e  = sum_b W[e, b] * z_b
     gm_e     = clamp(gm0_e * exp(delta_e), gm_min, gm_max)
 
-Identity init (load-bearing): ``W = P @ Q`` is zero-initialized, so with
-``W = 0`` every edge keeps ``gm_e = gm0_e`` exactly (``exp(0) = 1``) and the
-epoch-0 forward is identical to the no-GLN model. ``a, c`` start at zero
-(``z ~= 0`` as well, which also zeroes the first-order sensitivity of the
-modulation until P/Q move).
+Identity init (load-bearing): the edge mix is zero at startup
+(``W = P @ Q = 0``), so every edge keeps ``gm_e = gm0_e`` exactly
+(``exp(0) = 1``) and the epoch-0 forward is identical to the no-GLN model.
+The init is *asymmetric* so training is not a dead saddle: ``a`` and ``P``
+are drawn from ``N(0, 0.01)`` while ``c = 0`` and ``Q = 0``. With ``Q = 0``
+``W`` stays exactly zero (identity), but ``d(gm)/dQ = P . z != 0`` — the
+rails output a small nonzero ``z`` (``a != 0``) and P is nonzero, so Q
+receives a nonzero gradient on step 0. Once Q moves, ``W != 0`` and
+``P``/``a``/``c``/``alpha`` all receive signal through ``z``. Zeroing both
+``z`` and ``W`` (a = c = P = Q = 0) would make every GLN gradient exactly
+zero forever — F2 would silently train as if absent.
 
 v1 scope (per the plan):
   - One shared ``GLNRails`` core ``(a, c, alpha_raw)`` for the whole net
@@ -52,7 +58,13 @@ class _EdgeMix(nn.Module):
 
     def __init__(self, n_edges: int, rank: int, n_rails: int) -> None:
         super().__init__()
-        self.P = nn.Parameter(torch.zeros(int(n_edges), int(rank)))
+        # Asymmetric init (breaks the factorized dead saddle): ``P`` gets a
+        # small nonzero draw while ``Q`` stays exactly zero, so ``W = P @ Q =
+        # 0`` (identity: ``gm = gm0``) but ``d(delta)/dQ = P . z != 0`` gives
+        # Q a nonzero gradient on step 0. Once Q moves, ``W != 0`` and P /
+        # the rails receive signal. Zero-initing BOTH factors would make
+        # every GLN gradient exactly zero forever.
+        self.P = nn.Parameter(torch.randn(int(n_edges), int(rank)) * 0.01)
         self.Q = nn.Parameter(torch.zeros(int(rank), int(n_rails)))
 
     def weight(self) -> torch.Tensor:
@@ -72,9 +84,10 @@ class GLNRails(nn.Module):
         gm_max: Upper clamp of the modulated gm (default 10.0). This is the
             same ceiling as F1's searchable ``gm_max``.
         alpha_init: Initial rail steepness before the softplus map (default
-            1.0). ``a, c`` start at zero, so the rails output ``z ~= 0`` at
-            init regardless of ``alpha``; the identity property does not
-            depend on ``alpha``.
+            1.0). ``a`` starts at ``N(0, 0.01)`` and ``c`` at zero, so the
+            rails output a small nonzero ``z`` at init regardless of
+            ``alpha``; the identity property (``gm = gm0`` at ``W = 0``)
+            does not depend on ``alpha`` or on ``z``.
     """
 
     def __init__(
@@ -101,7 +114,12 @@ class GLNRails(nn.Module):
         self.gm_max = float(gm_max)
         self.in_dim = int(in_dim)
         # Rails: a [B, in_dim], c [B], alpha_raw [B] (softplus -> alpha > 0).
-        self.a = nn.Parameter(torch.zeros(self.B, self.in_dim))
+        # ``a`` gets a small nonzero init (VCA-style, scale 0.01) so the
+        # rails output ``z != 0`` at startup and P/Q receive a nonzero
+        # gradient on step 0 (zero-initing ``a`` AND ``W`` would deadlock
+        # every GLN gradient at exactly zero forever). Identity is carried
+        # by ``W = P @ Q = 0`` alone: gm = gm0 regardless of z.
+        self.a = nn.Parameter(torch.randn(self.B, self.in_dim) * 0.01)
         self.c = nn.Parameter(torch.zeros(self.B))
         self.alpha_raw = nn.Parameter(
             torch.full((self.B,), inv_softplus(alpha_init))

@@ -1105,6 +1105,20 @@ def main() -> None:
     print(f"[kn_bayes_opt] readout={args.readout} "
           f"(readout_mode={bo_readout_mode}, senses_per_node={bo_readout_senses}); "
           f"seed trial stays the reference temporal config")
+    # F1/F2 are budgeted for the CTLE feasible-arch list (the sampling
+    # counter builds them into the count), but the CTLE trial command runs
+    # the dagger harness, which has no --learnable-clip-sharpness /
+    # --gln-rails flags — the actual trial would silently train WITHOUT the
+    # features while the budget assumed them. Fail loud until the harness
+    # supports the flags.
+    if args.dataset == "ctle" and (args.learnable_clip_sharpness or args.gln_rails):
+        raise SystemExit(
+            "--learnable-clip-sharpness / --gln-rails cannot be combined "
+            "with dataset=ctle: the CTLE dagger harness does not support "
+            "these flags yet, so the trial commands would not build the "
+            "features the parameter budget assumed. Re-run without them "
+            "(or wire the flags through the dagger harness first)."
+        )
 
     # Joint feasible-architecture lists (computed once per study). Every
     # tuple's build-based param count is at or under the soft cap by
@@ -1266,6 +1280,21 @@ def main() -> None:
             study.enqueue_trial(
                 START_POINTS[args.dataset],
                 user_attrs={"seed_trial": True},
+            )
+        if args.gln_rails:
+            # The seed anchor always runs the reference *temporal* config
+            # (pre-existing convention), which has no shared-sense readout
+            # family — GLN (readout family requires shared_sense) is skipped
+            # for the seed trial only. Its param count therefore differs from
+            # the GLN-budgeted feasible list.
+            import warnings as _warnings
+            _warnings.warn(
+                "--gln-rails with a seed trial: trial 0 runs the reference "
+                "temporal config WITHOUT GLN (shared-sense readout required "
+                "for the GLN readout family), so its param count differs from "
+                "the GLN-budgeted study. Pass --no-seed-trial for a fully "
+                "GLN-consistent study.",
+                stacklevel=2,
             )
 
     ctle_cache_dir: Path | None = None
