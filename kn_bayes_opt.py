@@ -184,6 +184,14 @@ SMALL_WORLD_P_FIXED = 0.2
 STEPS_PER_T_SPAN = 10.0
 SPARSITY_LAMBDA_FIXED = 0.0
 ENTROPY_LAMBDA_FIXED = 1e-6
+# Pinned CTLE MoE labels (no expert architecture in KNet): the KNet student
+# harness has no MoE code (no consumer for --kn-moe-*) and the BO param
+# counter ignores these dims, so sampling them would waste trials on a flat
+# manifold. Pinned to singletons matching the START_POINTS ctle anchor
+# (experts=3, gate_rank=2); they ride the feasible tuple + trial argv as
+# inert schema labels only and can never change the built architecture.
+CTLE_MOE_NUM_EXPERTS_PINNED = 3
+CTLE_MOE_GATE_RANK_PINNED = 2
 
 # Canonical Phase-A mode (plan canonical-ctle-unify): the KNet student is
 # always trained with the Friedman-winning differential LR recipe (mapper 1.0,
@@ -565,6 +573,9 @@ def _build_dagger_command(
         "--kn-small-world-k", str(kn_small_world_k),
         "--kn-small-world-p", f"{kn_small_world_p:.6f}",
         "--kn-vca-rank", str(kn_vca_rank),
+        # --kn-moe-* are inert schema labels: the harness has no MoE
+        # consumer (silently ignored via parse_known_args). Forwarded only
+        # so trial logs stay comparable with earlier studies.
         "--kn-moe-num-experts", str(kn_moe_num_experts),
         "--kn-moe-gate-rank", str(kn_moe_gate_rank),
         "--kn-moe-top-k", str(kn_moe_top_k),
@@ -1144,8 +1155,8 @@ def main() -> None:
                 dagger=True,
                 readout_mode=bo_readout_mode,
                 readout_senses=bo_readout_senses,
-                moe_experts_choices=(2, 3),
-                moe_gate_rank_choices=(1, 2, 3),
+                moe_experts_choices=(CTLE_MOE_NUM_EXPERTS_PINNED,),
+                moe_gate_rank_choices=(CTLE_MOE_GATE_RANK_PINNED,),
                 require_moe=True,
                 learnable_clip=bool(args.learnable_clip_sharpness),
                 gln_on=bool(args.gln_rails),
@@ -1334,8 +1345,10 @@ def main() -> None:
                 num_stages = sp["num_stages"]
                 t_span = sp["t_span"]
                 vca_rank = sp.get("vca_rank", 2)
-                moe_num_experts = sp.get("moe_num_experts", 3)
-                moe_gate_rank = sp.get("moe_gate_rank", 2)
+                # Pinned MoE labels (match CTLE_MOE_*_PINNED; inert, no
+                # architectural effect).
+                moe_num_experts = sp.get("moe_num_experts", CTLE_MOE_NUM_EXPERTS_PINNED)
+                moe_gate_rank = sp.get("moe_gate_rank", CTLE_MOE_GATE_RANK_PINNED)
                 lr = sp["lr"]
                 weight_decay = sp["weight_decay"]
                 batch_size = sp["batch_size"]
@@ -1344,15 +1357,18 @@ def main() -> None:
                 x_max = sp["x_max"]
                 seed_boundary_map = sp["boundary_fan_out"]
             else:
-                # Joint feasible sampling: one fixed categorical over the whole
-                # (hidden, stages, k, rank, fanout, moe_experts, moe_gate_rank)
-                # manifold under the soft cap. Replaces independent
-                # suggest_int(num_hidden) + fixed-choice small_world_k +
-                # TrialPruned(k >= hidden). t_span/lr/wd/batch stay independent
-                # (they never move the param count).
+                # Joint feasible sampling: one fixed categorical over the
+                # (hidden, stages, k, rank, fanout) manifold under the soft
+                # cap (moe_experts/moe_gate_rank are pinned singletons with
+                # no architectural effect — see CTLE_MOE_*_PINNED). Replaces
+                # independent suggest_int(num_hidden) + fixed-choice
+                # small_world_k + TrialPruned(k >= hidden). t_span/lr/wd/batch
+                # stay independent (they never move the param count).
                 arch_idx = bps.sample_arch_idx(trial, "kn_arch_idx", knet_ctle_feasible)
                 (num_hidden, num_stages, small_world_k, vca_rank,
                  fanout_count, moe_num_experts, moe_gate_rank) = knet_ctle_feasible[arch_idx]
+                assert moe_num_experts == CTLE_MOE_NUM_EXPERTS_PINNED, moe_num_experts
+                assert moe_gate_rank == CTLE_MOE_GATE_RANK_PINNED, moe_gate_rank
                 trial.set_user_attr("kn_arch_tuple",
                                     json.dumps(list(knet_ctle_feasible[arch_idx])))
                 small_world_p = SMALL_WORLD_P_FIXED
@@ -1415,6 +1431,9 @@ def main() -> None:
                     "--kn-x-max", f"{x_max:.6f}",
                     "--kn-gm-max", f"{gm_max:.6e}",
                     "--kn-isat-max", f"{isat_max:.6e}",
+                    # --kn-moe-*: pinned inert labels (see
+                    # CTLE_MOE_*_PINNED); forwarded for log comparability
+                    # only, ignored by the harness.
                     "--kn-moe-num-experts", str(moe_num_experts),
                     "--kn-moe-gate-rank", str(moe_gate_rank),
                     "--kn-moe-top-k", str(args.ctle_moe_top_k),

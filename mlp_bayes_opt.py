@@ -454,6 +454,51 @@ def main() -> None:
 
     patience = args.epochs  # full fixed-budget run, no early stopping
 
+    # Joint feasible-architecture lists, computed once per study. Every
+    # suggested architecture satisfies the soft cap by construction; budget
+    # misses that survive (preflight mismatch) become finite graded penalties.
+    # Same soft cap as CTLE/MoE path: budget*(1+param_tolerance).
+    # NOTE: must precede the sampling fingerprint below, which records
+    # len(moe_feasible)/len(plain_feasible) — referencing them before this
+    # block raises UnboundLocalError.
+    plain_soft_limit = int(param_budget * (1.0 + args.param_tolerance))
+    moe_soft_limit = plain_soft_limit
+    moe_feasible = bps.moe_feasible_arches(
+        soft_limit=moe_soft_limit,
+        layers_range=(2, 3),
+        experts_range=(2, 4),
+        width_range=(32, 64),
+        input_dim=4 if args.input_preprocessing == "knet" else 8,
+    )
+    # Non-CTLE plain-MLP feasible (num_layers, hidden_dim) tuples. Width range
+    # is derived analytically per depth (smallest to largest width fitting the
+    # soft cap) so uniform categorical sampling yields near-budget trials
+    # instead of being dominated by tiny models from a [1,4096] sweep.
+    plain_width_ranges = bps.mlp_feasible_width_ranges(
+        soft_limit=plain_soft_limit, in_dim=in_dim, out_dim=out_dim,
+        layers_range=(2, args.n_layers_max), ln=False,
+    )
+    plain_feasible = bps.mlp_feasible_arches(
+        soft_limit=plain_soft_limit,
+        in_dim=in_dim, out_dim=out_dim,
+        layers_range=(2, args.n_layers_max),
+        width_range=plain_width_ranges,
+        ln_options=(False,),
+    )
+    if args.dataset != "ctle":
+        bps.require_feasible(plain_feasible, "plain MLP", plain_soft_limit)
+    else:
+        bps.require_feasible(moe_feasible, "CTLE MoE", moe_soft_limit)
+        # The 44-width seed config must be in the feasible list; fall back to
+        # the nearest feasible tuple otherwise so the seed always runs.
+        if not any(l == 3 and w == 44 and e == 3 for l, e, w in moe_feasible):
+            print(f"[mlp_bayes_opt] WARNING: seed arch (44,3,3) not feasible "
+                  f"under soft cap {moe_soft_limit}; first feasible tuple will "
+                  "replace it in the seed trial")
+    print(f"[mlp_bayes_opt] feasible arches: moe={len(moe_feasible)} "
+          f"plain={len(plain_feasible)} (soft_limit={moe_soft_limit}, "
+          f"plain widths per layer: {plain_width_ranges})")
+
     sampler = TPESampler(seed=args.seed, multivariate=True, group=True)
     # Sampling fingerprint: changing (budget, tolerance, dataset, n_arches,
     # width_range, layers_range) between runs of the same study.db would crash
@@ -537,48 +582,6 @@ def main() -> None:
               f"{args.ctle_epochs_per_iter}, eval={args.ctle_common_eval_size} "
               f"every {args.ctle_earlystop_eval_every} epochs, "
               f"param_limit={param_budget * (1.0 + args.param_tolerance):.0f}")
-
-    # Joint feasible-architecture lists, computed once per study. Every
-    # suggested architecture satisfies the soft cap by construction; budget
-    # misses that survive (preflight mismatch) become finite graded penalties.
-    # Same soft cap as CTLE/MoE path: budget*(1+param_tolerance).
-    plain_soft_limit = int(param_budget * (1.0 + args.param_tolerance))
-    moe_soft_limit = plain_soft_limit
-    moe_feasible = bps.moe_feasible_arches(
-        soft_limit=moe_soft_limit,
-        layers_range=(2, 3),
-        experts_range=(2, 4),
-        width_range=(32, 64),
-        input_dim=4 if args.input_preprocessing == "knet" else 8,
-    )
-    # Non-CTLE plain-MLP feasible (num_layers, hidden_dim) tuples. Width range
-    # is derived analytically per depth (smallest to largest width fitting the
-    # soft cap) so uniform categorical sampling yields near-budget trials
-    # instead of being dominated by tiny models from a [1,4096] sweep.
-    plain_width_ranges = bps.mlp_feasible_width_ranges(
-        soft_limit=plain_soft_limit, in_dim=in_dim, out_dim=out_dim,
-        layers_range=(2, args.n_layers_max), ln=False,
-    )
-    plain_feasible = bps.mlp_feasible_arches(
-        soft_limit=plain_soft_limit,
-        in_dim=in_dim, out_dim=out_dim,
-        layers_range=(2, args.n_layers_max),
-        width_range=plain_width_ranges,
-        ln_options=(False,),
-    )
-    if args.dataset != "ctle":
-        bps.require_feasible(plain_feasible, "plain MLP", plain_soft_limit)
-    else:
-        bps.require_feasible(moe_feasible, "CTLE MoE", moe_soft_limit)
-        # The 44-width seed config must be in the feasible list; fall back to
-        # the nearest feasible tuple otherwise so the seed always runs.
-        if not any(l == 3 and w == 44 and e == 3 for l, e, w in moe_feasible):
-            print(f"[mlp_bayes_opt] WARNING: seed arch (44,3,3) not feasible "
-                  f"under soft cap {moe_soft_limit}; first feasible tuple will "
-                  "replace it in the seed trial")
-    print(f"[mlp_bayes_opt] feasible arches: moe={len(moe_feasible)} "
-          f"plain={len(plain_feasible)} (soft_limit={moe_soft_limit}, "
-          f"plain widths per layer: {plain_width_ranges})")
 
     def objective(trial: optuna.Trial) -> float:
         # ── CTLE fast DAgger proxy (4×100, Test 1000) ───────────────────
