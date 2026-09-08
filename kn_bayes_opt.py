@@ -1106,18 +1106,20 @@ def main() -> None:
           f"(readout_mode={bo_readout_mode}, senses_per_node={bo_readout_senses}); "
           f"seed trial stays the reference temporal config")
     # F1/F2 are budgeted for the CTLE feasible-arch list (the sampling
-    # counter builds them into the count), but the CTLE trial command runs
-    # the dagger harness, which has no --learnable-clip-sharpness /
-    # --gln-rails flags — the actual trial would silently train WITHOUT the
-    # features while the budget assumed them. Fail loud until the harness
-    # supports the flags.
-    if args.dataset == "ctle" and (args.learnable_clip_sharpness or args.gln_rails):
+    # counter builds them into the count) and the Phase-A trial command
+    # forwards them as --kn-* flags to the dagger harness, which builds the
+    # same features. The legacy (non-Phase-A) dagger command has no such
+    # flags — the trial would silently train WITHOUT the features while the
+    # budget assumed them, so that combination still fails loud.
+    if (args.dataset == "ctle" and not args.ctle_phase_a
+            and (args.learnable_clip_sharpness or args.gln_rails)):
         raise SystemExit(
             "--learnable-clip-sharpness / --gln-rails cannot be combined "
-            "with dataset=ctle: the CTLE dagger harness does not support "
-            "these flags yet, so the trial commands would not build the "
-            "features the parameter budget assumed. Re-run without them "
-            "(or wire the flags through the dagger harness first)."
+            "with dataset=ctle outside --ctle-phase-a: the legacy dagger "
+            "command does not forward these flags, so trials would not "
+            "build the features the parameter budget assumed. Re-run "
+            "without them (or use --ctle-phase-a, whose trial command "
+            "forwards them as --kn-* flags)."
         )
 
     # Joint feasible-architecture lists (computed once per study). Every
@@ -1442,6 +1444,18 @@ def main() -> None:
                 if args.ctle_phase_a_mlp_teacher_ckpt is not None:
                     cmd += ["--phase-a-mlp-teacher-ckpt",
                             str(args.ctle_phase_a_mlp_teacher_ckpt)]
+                # F1/F2 study flags -> harness --kn-* flags. Clip has no
+                # readout constraint so it rides every trial including the
+                # seed. GLN's readout family needs shared/shared-x2, but the
+                # seed anchor always runs temporal — GLN is skipped for the
+                # seed only (warned at enqueue time below).
+                if args.learnable_clip_sharpness:
+                    cmd += ["--kn-learnable-clip-sharpness"]
+                if args.gln_rails and not is_seed_trial:
+                    cmd += ["--kn-gln-rails",
+                            "--kn-gln-B", str(args.gln_B),
+                            "--kn-gln-rank", str(args.gln_rank),
+                            "--kn-gln-families", str(args.gln_families)]
                 if t_span is not None:
                     cmd += ["--t-span", f"{t_span:.6f}"]
                 bfo = seed_boundary_map if seed_boundary_map is not None else build_boundary_fan_out(

@@ -633,6 +633,20 @@ KN_X_MAX            = 4.0     # local knet rail (overrides PHYS["x_max"]=3.0 via
 KN_GM_MAX           = None    # cell-library gm_max override (None -> config default 10.0); set via --kn-gm-max
 KN_ISAT_MAX         = None    # cell-library isat_max override (None -> config default 10.0); set via --kn-isat-max
 
+# Learnable soft-rail clip sharpness (F1) + GLN rails (F2) knobs — mirrored
+# from train_script.py so the DAgger student matches the canonical surface.
+# Both default off: clip denominator stays the fixed config clip_softness and
+# no GLN module is built, so the forward is bit-identical to baseline.
+KN_LEARNABLE_CLIP_SHARPNESS = False  # --kn-learnable-clip-sharpness: per-stage learnable clip sharpness (+num_stages params)
+KN_CLIP_SHARPNESS_INIT      = None   # --kn-clip-sharpness-init (None -> config PHYS['clip_sharpness_init'])
+KN_CLIP_SHARPNESS_MIN       = None   # --kn-clip-sharpness-min  (None -> config PHYS['clip_sharpness_min'])
+KN_CLIP_SHARPNESS_MAX       = None   # --kn-clip-sharpness-max  (None -> config PHYS['clip_sharpness_max'])
+KN_GLN_RAILS                = False  # --kn-gln-rails: shared input-conditioned log-gm rails (boundary + readout-sense)
+KN_GLN_B                    = 4      # --kn-gln-B: tanh half-space rail count
+KN_GLN_RANK                 = 2      # --kn-gln-rank: per-family P@Q factorization rank
+KN_GLN_ALPHA_INIT           = 1.0    # --kn-gln-alpha-init: rail steepness before softplus
+KN_GLN_FAMILIES             = "boundary,readout"  # --kn-gln-families: gated families (v1: boundary + readout only)
+
 # VCA (Voltage-Controlled Amplifier) gating knobs — mirrored from train_script.py
 # argparse flags so the DAgger student matches the canonical train.py surface.
 # Identity-at-init is preserved: with --vca on, vca_W is zero-init and the
@@ -693,6 +707,22 @@ try:
                                  "private learnable Vref rail + dense crossbar W[7 x h]. "
                                  "'shared-x2' = two senses per node (different gm operating "
                                  "points) + W[7 x 2h]. Fixed per study; BO never samples it.")
+    _bo_parser.add_argument('--kn-learnable-clip-sharpness', action='store_true', default=False,
+                            help='Make the soft-rail clip sharpness a learnable per-stage '
+                                 'scalar (F1; off by default, bit-identical forward). '
+                                 'Adds one trainable param per stage.')
+    _bo_parser.add_argument('--kn-clip-sharpness-init', type=float, default=None)
+    _bo_parser.add_argument('--kn-clip-sharpness-min', type=float, default=None)
+    _bo_parser.add_argument('--kn-clip-sharpness-max', type=float, default=None)
+    _bo_parser.add_argument('--kn-gln-rails', action='store_true', default=False,
+                            help='Enable shared GLN rails (F2): input-conditioned log-gm '
+                                 'modulation on boundary + readout-sense OTAs. Off by '
+                                 'default (identity: gm = gm0). Requires --kn-readout '
+                                 'shared/shared-x2 for the readout family.')
+    _bo_parser.add_argument('--kn-gln-B', type=int, default=None)
+    _bo_parser.add_argument('--kn-gln-rank', type=int, default=None)
+    _bo_parser.add_argument('--kn-gln-alpha-init', type=float, default=None)
+    _bo_parser.add_argument('--kn-gln-families', type=str, default=None)
     _bo_parser.add_argument('--t-span', type=float, default=None)
     _bo_parser.add_argument('--boundary-fan-out', type=str, default=None)
     _bo_parser.add_argument('--lr', type=float, default=None)
@@ -848,6 +878,27 @@ try:
         KN_GM_MAX = float(_bo_args.kn_gm_max)
     if _bo_args.kn_isat_max is not None:
         KN_ISAT_MAX = float(_bo_args.kn_isat_max)
+    # F1/F2 overrides: forwarded into the student constructor so the BO-fixed
+    # study flags build the features the parameter budget assumed. Clip adds
+    # +num_stages params; GLN adds the shared rails + per-family edge mixes.
+    if _bo_args.kn_learnable_clip_sharpness:
+        KN_LEARNABLE_CLIP_SHARPNESS = True
+    if _bo_args.kn_clip_sharpness_init is not None:
+        KN_CLIP_SHARPNESS_INIT = float(_bo_args.kn_clip_sharpness_init)
+    if _bo_args.kn_clip_sharpness_min is not None:
+        KN_CLIP_SHARPNESS_MIN = float(_bo_args.kn_clip_sharpness_min)
+    if _bo_args.kn_clip_sharpness_max is not None:
+        KN_CLIP_SHARPNESS_MAX = float(_bo_args.kn_clip_sharpness_max)
+    if _bo_args.kn_gln_rails:
+        KN_GLN_RAILS = True
+    if _bo_args.kn_gln_B is not None:
+        KN_GLN_B = int(_bo_args.kn_gln_B)
+    if _bo_args.kn_gln_rank is not None:
+        KN_GLN_RANK = int(_bo_args.kn_gln_rank)
+    if _bo_args.kn_gln_alpha_init is not None:
+        KN_GLN_ALPHA_INIT = float(_bo_args.kn_gln_alpha_init)
+    if _bo_args.kn_gln_families is not None:
+        KN_GLN_FAMILIES = str(_bo_args.kn_gln_families)
 except Exception as _e:
     _logger.warning(f"[BO] override parsing failed: {_e}")
 
@@ -1688,7 +1739,16 @@ class LocalKirchhoffStudentWrapper(nn.Module):
                  vca_bias: bool = False,
                  gm_max: float | None = None,
                  isat_max: float | None = None,
-                 kn_readout: str = "temporal"):
+                 kn_readout: str = "temporal",
+                 learnable_clip_sharpness: bool = False,
+                 clip_sharpness_init: float | None = None,
+                 clip_sharpness_min: float | None = None,
+                 clip_sharpness_max: float | None = None,
+                 gln_rails: bool = False,
+                 gln_B: int = 4,
+                 gln_rank: int = 2,
+                 gln_alpha_init: float = 1.0,
+                 gln_families: str | None = None):
         super().__init__()
 
         if param_log_bounds is None:
@@ -1740,6 +1800,18 @@ class LocalKirchhoffStudentWrapper(nn.Module):
         # train_script.py and kn_bayes_opt.py conventions.
         self.gm_max = float(gm_max) if gm_max is not None else None
         self.isat_max = float(isat_max) if isat_max is not None else None
+        # F1 learnable clip sharpness (per-stage scalar, off by default) and
+        # F2 GLN rails (shared module, off by default). None bounds fall back
+        # to config PHYS['clip_sharpness_*'] inside DifferentialStage.
+        self.learnable_clip_sharpness = bool(learnable_clip_sharpness)
+        self.clip_sharpness_init = float(clip_sharpness_init) if clip_sharpness_init is not None else None
+        self.clip_sharpness_min = float(clip_sharpness_min) if clip_sharpness_min is not None else None
+        self.clip_sharpness_max = float(clip_sharpness_max) if clip_sharpness_max is not None else None
+        self.gln_rails = bool(gln_rails)
+        self.gln_B = int(gln_B)
+        self.gln_rank = int(gln_rank)
+        self.gln_alpha_init = float(gln_alpha_init)
+        self.gln_families = str(gln_families) if gln_families is not None else None
         # Readout family (CTLE Phase-A wired-readout plan §2.2): 'temporal'
         # = legacy h*7 OTA mesh; 'shared' = 1 sense/hidden + dense crossbar
         # W[7 x h]; 'shared-x2' = 2 senses/hidden (per-node gm jitter) +
@@ -1820,7 +1892,15 @@ class LocalKirchhoffStudentWrapper(nn.Module):
             enable_temporal_readout=enable_temporal_readout,
             readout_mode=readout_mode,
             readout_senses_per_node=int(readout_senses),
-
+            learnable_clip_sharpness=self.learnable_clip_sharpness,
+            clip_sharpness_init=self.clip_sharpness_init,
+            clip_sharpness_min=self.clip_sharpness_min,
+            clip_sharpness_max=self.clip_sharpness_max,
+            gln_rails=self.gln_rails,
+            gln_B=self.gln_B,
+            gln_rank=self.gln_rank,
+            gln_alpha_init=self.gln_alpha_init,
+            gln_families=self.gln_families,
             x_max=self.x_max,
             vca_enabled=self.vca_enabled,
             vca_rank=self.vca_rank,
@@ -3032,6 +3112,15 @@ student = LocalKirchhoffStudentWrapper(
     gm_max=KN_GM_MAX,
     isat_max=KN_ISAT_MAX,
     kn_readout=KN_READOUT,
+    learnable_clip_sharpness=KN_LEARNABLE_CLIP_SHARPNESS,
+    clip_sharpness_init=KN_CLIP_SHARPNESS_INIT,
+    clip_sharpness_min=KN_CLIP_SHARPNESS_MIN,
+    clip_sharpness_max=KN_CLIP_SHARPNESS_MAX,
+    gln_rails=KN_GLN_RAILS,
+    gln_B=KN_GLN_B,
+    gln_rank=KN_GLN_RANK,
+    gln_alpha_init=KN_GLN_ALPHA_INIT,
+    gln_families=KN_GLN_FAMILIES,
 ).to(DEVICE)
 
 _logger.info(
@@ -3063,7 +3152,9 @@ _logger.info(
     f"edge_repeats={KN_EDGE_REPEATS}, cell_library={KN_CELL_LIBRARY}, "
     f"leak_mode={KN_LEAK_MODE}, interstage_activation={KN_INTERSTAGE_ACTIVATION}, "
      f"freeze_read={KN_FREEZE_READ}, temporal_readout={KN_TEMPORAL_READOUT}, input_rail={KN_INPUT_RAIL}, "
-     f"x_max={KN_X_MAX}, gm_max={KN_GM_MAX}, isat_max={KN_ISAT_MAX})"
+     f"x_max={KN_X_MAX}, gm_max={KN_GM_MAX}, isat_max={KN_ISAT_MAX}, "
+     f"learnable_clip={KN_LEARNABLE_CLIP_SHARPNESS}, gln_rails={KN_GLN_RAILS}, "
+     f"gln_B={KN_GLN_B}, gln_rank={KN_GLN_RANK}, gln_families={KN_GLN_FAMILIES})"
 )
 _n_trainable = sum(p.numel() for p in student.parameters() if p.requires_grad)
 _logger.info(f"Student trainable params: {_n_trainable:,}")
@@ -3085,6 +3176,7 @@ if getattr(_bo_args, 'count_params_only', False):
 #             + .vca_W / .vca_W_core / .vca_v_{boundary,readout,core}
 #             (VCA routing-structure params, train.py:1102-1108)
 #   - dyn:    name.endswith('.raw_leak') or '.raw_drive_g'
+#             + '.clip_sharpness_raw' (F1) + 'gln_rails.*' (F2)
 #   - other:  everything else (stages/transfers/vref/etc.)
 # The 'lr_scale' key is stored in each group dict so the per-iteration LR
 # reset at dagger:3004-3010 can multiply the base LR by the group's scale.
@@ -3110,7 +3202,12 @@ def _make_dagger_optimizer(student, lr, weight_decay):
             # routed to the structural LR group (4x base by convention)
             # so the gate signal learns alongside z_logits.
             _struct.append(_p)
-        elif _name.endswith(".raw_leak") or _name.endswith(".raw_drive_g"):
+        elif (_name.endswith(".raw_leak") or _name.endswith(".raw_drive_g")
+              or _name.endswith(".clip_sharpness_raw")
+              or _name.startswith("gln_rails.")):
+            # F1/F2 params ride the dynamic LR group (same convention as
+            # train.py make_optimizer): per-stage clamp + input-conditioned
+            # rails adapt alongside the cell dynamics, not the structure.
             _dyn.append(_p)
         else:
             _other.append(_p)

@@ -114,6 +114,13 @@ BO fingerprints: `kn_bayes_opt.py` sampling fingerprint now includes
 - GLN is shared/tied across all stages in v1 (no per-stage rails/edge-mix).
 - `gm_max` (F1 searchable) is the post-modulation clamp ceiling; `gm0`
   still comes from the bounded sigmoid map into `[gm_min, gm_max]`.
+- Dagger/CTLE Phase-A wired (2026-09-08): `dagger-nuance-distillation-kirchhoffnet.py`
+  accepts `--kn-learnable-clip-sharpness` (+ `--kn-clip-sharpness-init/min/max`)
+  and `--kn-gln-rails` (+ `--kn-gln-B/rank/alpha-init/families`), threaded into
+  the student build with clip/GLN params in the dyn LR group; `kn_bayes_opt.py`
+  `--dataset ctle --ctle-phase-a` forwards the study flags (GLN skipped for the
+  temporal seed trial only). Legacy non-Phase-A dagger path still refuses the
+  combination (fail loud). `fixed-distillation-bayes-opt.py` remains out of scope.
 
 ## Dry run
 
