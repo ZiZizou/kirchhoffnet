@@ -55,6 +55,7 @@ import socket
 import subprocess
 import sys
 import time
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional, Sequence
 
@@ -107,16 +108,94 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     # ----- model -----
-    p.add_argument("--model-kind", choices=["knet", "mlp"], required=True,
-                   help="Which checkpoint family to load.")
+    p.add_argument("--model-kind",
+                   choices=["knet", "mlp", "moe", "knet-distill"],
+                   required=True,
+                   help="Which checkpoint family to load. 'knet' keeps its "
+                        "current SystemExit-to-bridge behaviour; 'moe' loads "
+                        "RegimeAwareMoE; 'knet-distill' rebuilds the KNet "
+                        "DAgger student from explicit flags.")
     p.add_argument("--ckpt", required=True, type=Path,
                    help="Path to the trained .pt checkpoint.")
     p.add_argument("--device", default="cpu",
                    help="Torch device for inference (default: cpu; 'cuda' on GPU hosts).")
 
+    # MoE loader knobs (defaults match mlp_model_files_bo_trials_0024).
+    p.add_argument("--moe-trunk-width", type=int, default=34)
+    p.add_argument("--moe-trunk-layers", type=int, default=3)
+    p.add_argument("--moe-num-experts", type=int, default=2)
+    p.add_argument("--moe-activation", choices=["silu", "gelu"], default="silu")
+
     # KNet rebuild hints (preferred: --kn-config-json; fallback: explicit flags).
     p.add_argument("--kn-config-json", type=Path, default=None,
                    help="Optional trial config JSON with all --kn-* fields.")
+    # Defaults mirror knet_model_files_manual_trial_0011/run_command.txt
+    # (verified against its .out log: 5,649 params, VCA on rank 3 core,
+    # shared-x2 readout, GLN boundary+readout).
+    p.add_argument("--kn-num-stages", type=int, default=7)
+    p.add_argument("--kn-num-hidden", type=int, default=11)
+    p.add_argument("--kn-small-world-k", type=int, default=2)
+    p.add_argument("--kn-small-world-p", type=float, default=0.2)
+    p.add_argument("--kn-small-world-seed", type=int, default=1)
+    p.add_argument("--kn-edge-repeats", type=int, default=2)
+    p.add_argument("--kn-cell-library", default="tanh_free")
+    p.add_argument("--kn-leak-mode", default="non-programmable")
+    p.add_argument("--kn-interstage-activation", default="residual-relu-tanh")
+    p.add_argument("--kn-freeze-read", dest="kn_freeze_read",
+                   action="store_true", default=True)
+    p.add_argument("--no-kn-freeze-read", dest="kn_freeze_read",
+                   action="store_false")
+    p.add_argument("--kn-temporal-readout", dest="kn_temporal_readout",
+                   action="store_true", default=True)
+    p.add_argument("--no-kn-temporal-readout", dest="kn_temporal_readout",
+                   action="store_false")
+    p.add_argument("--kn-input-rail", type=float, default=4.0)
+    p.add_argument("--kn-vca-enabled", dest="kn_vca_enabled",
+                   action="store_true", default=True)
+    p.add_argument("--no-kn-vca-enabled", dest="kn_vca_enabled",
+                   action="store_false")
+    p.add_argument("--kn-vca-rank", type=int, default=3)
+    p.add_argument("--kn-vca-core", dest="kn_vca_core",
+                   action="store_true", default=True)
+    p.add_argument("--no-kn-vca-core", dest="kn_vca_core",
+                   action="store_false")
+    p.add_argument("--kn-vca-gate-shunt", dest="kn_vca_gate_shunt",
+                   action="store_true", default=False)
+    p.add_argument("--kn-vca-separate-core-bus", dest="kn_vca_separate_core_bus",
+                   action="store_true", default=True)
+    p.add_argument("--no-kn-vca-separate-core-bus",
+                   dest="kn_vca_separate_core_bus", action="store_false")
+    p.add_argument("--kn-vca-bias", dest="kn_vca_bias",
+                   action="store_true", default=False)
+    p.add_argument("--kn-x-max", type=float, default=4.0)
+    p.add_argument("--kn-gm-max", type=float, default=4.241970)
+    p.add_argument("--kn-isat-max", type=float, default=2.868855e+01)
+    p.add_argument("--kn-readout", default="shared-x2",
+                   choices=["temporal", "shared", "shared-x2"])
+    p.add_argument("--kn-learnable-clip-sharpness", action="store_true",
+                   default=True)
+    p.add_argument("--no-kn-learnable-clip-sharpness",
+                   dest="kn_learnable_clip_sharpness", action="store_false")
+    p.add_argument("--kn-clip-sharpness-init", type=float, default=None)
+    p.add_argument("--kn-clip-sharpness-min", type=float, default=None)
+    p.add_argument("--kn-clip-sharpness-max", type=float, default=None)
+    p.add_argument("--kn-gln-rails", action="store_true", default=True)
+    p.add_argument("--no-kn-gln-rails", dest="kn_gln_rails", action="store_false")
+    p.add_argument("--kn-gln-B", type=int, default=4)
+    p.add_argument("--kn-gln-rank", type=int, default=2)
+    p.add_argument("--kn-gln-alpha-init", type=float, default=1.0)
+    p.add_argument("--kn-gln-families", default="boundary,readout")
+    p.add_argument("--kn-t-span", type=float, default=4.660583,
+                   help="TOTAL integration span (run_command semantics); "
+                        "per-stage span = total / num_stages.")
+    p.add_argument("--kn-stage-num-steps", type=int, default=None,
+                   help="Per-stage Heun steps (default: round(70/num_stages)).")
+    p.add_argument("--kn-input-log-min", type=float, nargs=4, default=None,
+                   help="Override input_log_min (default: canonical npz).")
+    p.add_argument("--kn-input-log-max", type=float, nargs=4, default=None,
+                   help="Override input_log_max (default: canonical npz).")
+    p.add_argument("--kn-boundary-fan-out",
+                   default='{"0": [0, 4], "1": [1, 5], "2": [2, 6], "3": [3, 7]}')
 
     # MLP loader knobs (fallback when teacher_config.json is absent).
     p.add_argument("--mlp-width", type=int, default=48)
@@ -133,6 +212,9 @@ def build_parser() -> argparse.ArgumentParser:
     spec_src.add_argument("--specs-csv", type=Path, default=None,
                           help="CSV with header SPEC_INPUT_COLS (must have at "
                                "least those 4 columns).")
+    p.add_argument("--specs-idx-key", default=None,
+                   help="Optional npz key (e.g. 'test_idx') restricting the "
+                        "spec pool before subsampling. Requires --specs-npz.")
     p.add_argument("--pred-params-csv", type=Path, default=None,
                    help="Optional (N,7) log10-params CSV in PARAM_COLS order. "
                         "When given, Stage-1 inference is SKIPPED and these "
@@ -205,7 +287,13 @@ def build_parser() -> argparse.ArgumentParser:
 # ---------------------------------------------------------------------------
 
 def load_specs(args: argparse.Namespace) -> np.ndarray:
-    """Return (N, 4) float32 array in SPEC_INPUT_COLS order."""
+    """Return (N, 4) float32 array in SPEC_INPUT_COLS order.
+
+    When ``--specs-idx-key`` is given (only with --specs-npz), the spec pool
+    is restricted to ``npz[idx_key]`` before the seeded subsample step. This
+    mirrors how ``dagger-nuance-distillation-kirchhoffnet.py`` evaluates on
+    the held-out test split.
+    """
     if args.specs_npz is not None:
         try:
             data = np.load(args.specs_npz, allow_pickle=True)
@@ -214,21 +302,41 @@ def load_specs(args: argparse.Namespace) -> np.ndarray:
         if "specs" not in data:
             raise SystemExit(
                 f"[specs] {args.specs_npz} has no 'specs' key; keys={list(data.keys())}")
-        specs = np.asarray(data["specs"], dtype=np.float32)
-        if specs.ndim != 2 or specs.shape[1] != 4:
-            raise SystemExit(f"[specs] expected (N,4), got {specs.shape}")
+        all_specs = np.asarray(data["specs"], dtype=np.float32)
+        if all_specs.ndim != 2 or all_specs.shape[1] != 4:
+            raise SystemExit(f"[specs] expected (N,4), got {all_specs.shape}")
+        if args.specs_idx_key is not None:
+            if args.specs_idx_key not in data:
+                raise SystemExit(
+                    f"[specs] --specs-idx-key {args.specs_idx_key!r} not in "
+                    f"npz (keys={list(data.keys())})")
+            idx_pool = np.asarray(data[args.specs_idx_key], dtype=np.int64)
+            if idx_pool.ndim != 1:
+                raise SystemExit(
+                    f"[specs] {args.specs_idx_key!r} must be 1-D, got {idx_pool.shape}")
+            specs = all_specs[idx_pool]
+            logger.info("spec pool restricted by %s: %d -> %d",
+                        args.specs_idx_key, all_specs.shape[0], specs.shape[0])
+        else:
+            specs = all_specs
+        # Keep a handle on the npz so the KNet loader can read input_log_min/max.
+        args._specs_npz_data = data
     else:
         specs = _read_specs_csv(args.specs_csv)
+        args._specs_npz_data = None
 
     n = specs.shape[0]
     if args.smoke:
         n_take = min(2, n)
         return specs[:n_take].copy()
     if args.n_specs is not None and args.n_specs > 0:
+        if args.n_specs > n:
+            raise SystemExit(
+                f"[specs] --n-specs {args.n_specs} exceeds pool size {n}; "
+                f"raise --n-specs or drop --specs-idx-key.")
         offset = max(0, min(args.spec_offset, n - 1))
         rng = np.random.default_rng(args.seed)
         idx = np.arange(n)
-        # Deterministic seeded subsample: shuffle, then slice [offset:offset+n_specs].
         rng.shuffle(idx)
         idx = np.sort(idx[offset:offset + args.n_specs])
         return specs[idx].copy()
@@ -449,6 +557,621 @@ def predict_mlp(teacher: MlpTeacher, specs: np.ndarray, device: str,
             probs = torch.sigmoid(logits).detach().cpu().numpy().astype(np.float32)
         log_arr = log_lo + (log_hi - log_lo) * probs
         out[i:i + batch_size] = log_arr
+    return out
+
+
+# ---------------------------------------------------------------------------
+# MoE loader (RegimeAwareMoE) — used for mlp_model_files_bo_trials_0024.
+# ---------------------------------------------------------------------------
+
+@dataclass
+class MoeStudent:
+    """Lazy loader for a ``RegimeAwareMoE`` checkpoint.
+
+    Arch + scaler may come from:
+      1. ``--moe-*`` CLI flags + ``--input-preprocessing knet`` (default)
+      2. Embedded ``{"config": {...}}`` dict inside the checkpoint (optional)
+
+    Knet preprocessing requires only ``input_log_min`` / ``input_log_max``;
+    we prefer the npz's ``input_log_min``/``input_log_max`` keys (set when
+    the canonical Phase-A .npz is loaded), else fall back to CLI/sidecar,
+    else raise.
+    """
+    state_path: Path
+    trunk_width: int = 34
+    trunk_layers: int = 3
+    num_experts: int = 2
+    activation: str = "silu"
+    input_preprocessing: str = "knet"
+
+    def __post_init__(self):
+        self._mdl = None
+        self._scaler_attached = False
+        self._architecture = {}
+
+    def _effective_bounds(self, args) -> Optional[tuple]:
+        """Return (input_log_min, input_log_max) for knet, or None if not found."""
+        data = getattr(args, "_specs_npz_data", None)
+        if data is not None and "input_log_min" in data and "input_log_max" in data:
+            lo = np.asarray(data["input_log_min"], dtype=np.float32)
+            hi = np.asarray(data["input_log_max"], dtype=np.float32)
+            if lo.shape == (4,) and hi.shape == (4,):
+                return lo, hi
+        return None
+
+    def load(self, device: str, args=None):
+        if self._mdl is not None:
+            return self._mdl
+        import torch
+        try:
+            from ctle_dagger_common import RegimeAwareMoE  # type: ignore
+        except Exception as e:
+            raise SystemExit(
+                f"[moe-load] cannot import RegimeAwareMoE from ctle_dagger_common: {e}")
+        try:
+            raw = torch.load(self.state_path, map_location="cpu",
+                             weights_only=True)
+        except Exception:
+            raw = torch.load(self.state_path, map_location="cpu",
+                             weights_only=False)
+        # Best-effort embedded config (allows sidecar-free architecture).
+        arch = {
+            "trunk_width":   int(self.trunk_width),
+            "trunk_layers":  int(self.trunk_layers),
+            "num_experts":   int(self.num_experts),
+            "activation":    str(self.activation).lower(),
+            "use_log_features": False,  # knet preprocessing -> log features off
+        }
+        if isinstance(raw, dict) and "config" in raw and isinstance(raw["config"], dict):
+            cfg = raw["config"]
+            for k in ("trunk_width", "trunk_layers", "num_experts"):
+                if k in cfg:
+                    arch[k] = int(cfg[k])
+            if "activation" in cfg:
+                arch["activation"] = str(cfg["activation"]).lower()
+            if "use_log_features" in cfg:
+                arch["use_log_features"] = bool(cfg["use_log_features"])
+
+        # Shape inference from the checkpoint (authoritative): trunk.0 maps
+        # trunk_input_dim -> W, gate maps trunk_input_dim -> E, one weight per
+        # expert maps W -> 7, trunk depth reveals L.  CLI/embedded arch is a
+        # hint only; mismatches warn and the checkpoint wins.
+        state_probe = (raw["state_dict"] if isinstance(raw, dict)
+                       and "state_dict" in raw else raw)
+        inferred = _moe_arch_from_state(state_probe)
+        if inferred is not None:
+            iw, il, ie, ilog = inferred
+            for key, got, want in (
+                ("trunk_width", iw, arch["trunk_width"]),
+                ("trunk_layers", il, arch["trunk_layers"]),
+                ("num_experts", ie, arch["num_experts"]),
+            ):
+                if got != want:
+                    logger.warning(
+                        "[moe-load] checkpoint %s=%s != requested %s; "
+                        "using checkpoint architecture", key, got, want)
+            if ilog != bool(arch["use_log_features"]):
+                logger.warning(
+                    "[moe-load] checkpoint use_log_features=%s != requested "
+                    "%s; using checkpoint architecture",
+                    ilog, arch["use_log_features"])
+            arch["trunk_width"], arch["trunk_layers"], arch["num_experts"], \
+                arch["use_log_features"] = iw, il, ie, ilog
+
+        act_map = {"silu": torch.nn.SiLU, "gelu": torch.nn.GELU}
+        if arch["activation"] not in act_map:
+            raise SystemExit(
+                f"[moe-load] unsupported activation {arch['activation']!r}")
+        self._mdl = RegimeAwareMoE(
+            trunk_width=arch["trunk_width"],
+            trunk_layers=arch["trunk_layers"],
+            num_experts=arch["num_experts"],
+            activation=act_map[arch["activation"]],
+            use_log_features=bool(arch["use_log_features"]),
+        )
+        state = raw["state_dict"] if isinstance(raw, dict) and "state_dict" in raw else raw
+        try:
+            self._mdl.load_state_dict(state)
+        except Exception as e:
+            raise SystemExit(
+                f"[moe-load] state_dict mismatch for arch "
+                f"(W={arch['trunk_width']}, L={arch['trunk_layers']}, "
+                f"E={arch['num_experts']}, act={arch['activation']}, "
+                f"logfeat={arch['use_log_features']}): {e}. "
+                f"Check --moe-* flags vs embedded config.")
+
+        # Knet scaler attach. If kNN preprocessing is selected, the model
+        # also needs scaler_p_* + eye_scale_* but trial_0024's run_command
+        # uses knet, so we only support that path here.
+        prep = str(self.input_preprocessing)
+        if prep != "knet":
+            raise SystemExit(
+                f"[moe-load] only --input-preprocessing knet is wired for MoE "
+                f"here (got {prep!r}). trial_0024 used knet.")
+        bounds = self._effective_bounds(args) if args is not None else None
+        if bounds is not None:
+            lo, hi = bounds
+            self._mdl.attach_scaler(
+                scaler_p_scale=1.0, scaler_p_mean=0.0,
+                eye_scale_j=1.0, eye_scale_h=1.0, eye_scale_w=1.0,
+                input_preprocessing="knet",
+                input_log_min=lo, input_log_max=hi,
+            )
+            self._scaler_attached = True
+            logger.info(
+                "[moe-load] attached knet scaler (input_log_min/max from --specs-npz)")
+        else:
+            # Attach placeholder scalars so .forward() doesn't blow up; only
+            # the input_log_min/max fields are needed under knet preprocessing,
+            # but the kernel never checks them when input_preprocessing=='knet'.
+            self._mdl.attach_scaler(
+                scaler_p_scale=1.0, scaler_p_mean=0.0,
+                eye_scale_j=1.0, eye_scale_h=1.0, eye_scale_w=1.0,
+                input_preprocessing="knet",
+                input_log_min=np.array([-3., 0., 0., 0.], dtype=np.float32),
+                input_log_max=np.array([0., 2., 2., 2.], dtype=np.float32),
+            )
+            logger.warning(
+                "[moe-load] no input_log_min/max in --specs-npz; using "
+                "placeholder bounds [-3,0,0,0] -> [0,2,2,2].")
+
+        self._mdl = self._mdl.to(device)
+        self._mdl.eval()
+        for p in self._mdl.parameters():
+            p.requires_grad = False
+        self._architecture = arch
+        return self._mdl
+
+    @property
+    def architecture(self) -> dict:
+        return self._architecture
+
+
+def _moe_arch_from_state(state) -> Optional[tuple]:
+    """Infer (trunk_width, trunk_layers, num_experts, use_log_features).
+
+    Returns None when the state dict does not look like a RegimeAwareMoE.
+    """
+    try:
+        keys = set(state.keys())
+        if "trunk.0.weight" not in keys or "gate.weight" not in keys:
+            return None
+        w0 = state["trunk.0.weight"]
+        in_dim, width = int(w0.shape[1]), int(w0.shape[0])
+        experts = sorted({k.split(".")[1] for k in keys
+                          if k.startswith("experts.") and k.endswith(".weight")},
+                         key=int)
+        n_exp = len(experts)
+        depth = 0
+        i = 0
+        while f"trunk.{i}.weight" in keys:
+            depth += 1
+            i += 2  # Linear,Act,Linear,Act... (no LN in RegimeAwareMoE trunk)
+        use_log = (in_dim == 8)
+        if in_dim not in (4, 8):
+            return None
+        return width, depth, n_exp, use_log
+    except Exception:
+        return None
+
+
+def predict_moe(student: MoeStudent, specs: np.ndarray, device: str,
+                batch_size: int = 512, args=None) -> np.ndarray:
+    """Run the MoE student and return (N, 7) log10 params in PARAM_COLS order.
+
+    Mirrors ``RegimeAwareMoE.predict()``: sigmoid(logits) -> affine log map.
+    """
+    import torch
+    mdl = (student._mdl if student._mdl is not None
+           else student.load(device, args=args))
+    out = np.zeros((specs.shape[0], len(PARAM_COLS)), dtype=np.float32)
+    log_lo = mdl.log_lo.detach().cpu().numpy().astype(np.float32)
+    log_hi = mdl.log_hi.detach().cpu().numpy().astype(np.float32)
+    for i in range(0, specs.shape[0], batch_size):
+        x = torch.from_numpy(specs[i:i + batch_size]).to(device)
+        with torch.no_grad():
+            logits = mdl(x)
+            probs = torch.sigmoid(logits).detach().cpu().numpy().astype(np.float32)
+        log_arr = log_lo + (log_hi - log_lo) * probs
+        out[i:i + batch_size] = log_arr
+    return out
+
+
+# ---------------------------------------------------------------------------
+# KNet-distill loader (LocalKirchhoffStudentWrapper) — used for
+# knet_model_files_manual_trial_0011.
+# ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# KNet-distill loader — used for knet_model_files_manual_trial_0011.
+#
+# NOTE: this intentionally does NOT import dagger-nuance-distillation-
+# kirchhoffnet.py: that module executes its whole training prologue at import
+# (DATA_DIR scan, flow scalers, student build) and crashes without the
+# training data tree.  Instead KNetDistillWrapper below mirrors
+# LocalKirchhoffStudentWrapper.__init__/scale_input/forward/get_bounded_output
+# kwarg-for-kwarg (importing only the side-effect-free topology /
+# cell_library / config / ctle_dagger_common modules).  The strict
+# load_state_dict acts as a drift detector: any structural divergence from
+# the training-time class fails loudly instead of silently mis-inferring.
+# ---------------------------------------------------------------------------
+
+def _parse_boundary_fan_out(spec):
+    """Parse boundary fan-out JSON into {input_index: [targets...]}.
+
+    Accepts a JSON string (CLI-style) or an already-parsed dict. Mirrors
+    dagger-nuance-distillation-kirchhoffnet._parse_boundary_fan_out.
+    """
+    if isinstance(spec, dict):
+        return {int(k): list(v) for k, v in spec.items()}
+    return {int(k): list(v) for k, v in json.loads(spec).items()}
+
+
+class KNetDistillWrapper:
+    """Side-effect-free mirror of LocalKirchhoffStudentWrapper.
+
+    Constructor kwargs mirror the training-time signature exactly (minus the
+    optimizer-only LR scales, which never affect the built graph).  The
+    --t-span CLI flag carries the TOTAL span (run_command semantics); the
+    per-stage span is total/num_stages, matching SOLVER["t_span"]/num_stages.
+    input_log bounds default to the canonical npz values (same source the
+    Phase-A trainer used); --kn-input-log-min/max override.
+    """
+
+    def __init__(self, torch_mod, build_net_from_config, make_cell_library,
+                 vca_cfg_min_rank, num_stages=7, num_hidden=11,
+                 small_world_k=2, small_world_p=0.2, small_world_seed=1,
+                 edge_repeats=2, cell_library="tanh_free",
+                 leak_mode="non-programmable",
+                 interstage_activation="residual-relu-tanh",
+                 freeze_read=True, boundary_fan_out=None,
+                 enable_temporal_readout=True, num_targets=7,
+                 input_rail=4.0, x_max=4.0, param_log_bounds=None,
+                 input_log_min=None, input_log_max=None,
+                 t_span_total=4.660583, stage_num_steps=None, seed=None,
+                 vca_enabled=True, vca_rank=3, vca_core_enabled=True,
+                 vca_gate_shunt=False, vca_separate_core_bus=True,
+                 vca_bias=False, gm_max=None, isat_max=None,
+                 kn_readout="shared-x2", learnable_clip_sharpness=True,
+                 clip_sharpness_init=None, clip_sharpness_min=None,
+                 clip_sharpness_max=None, gln_rails=True, gln_B=4,
+                 gln_rank=2, gln_alpha_init=1.0,
+                 gln_families="boundary,readout"):
+        nn = torch_mod.nn
+        self._torch = torch_mod
+        if param_log_bounds is None:
+            param_log_bounds = PARAM_LOG_BOUNDS
+
+        self.num_stages = int(num_stages)
+        self.num_hidden = int(num_hidden)
+        self.small_world_k = int(small_world_k)
+        self.small_world_p = float(small_world_p)
+        self.small_world_seed = int(small_world_seed)
+        self.edge_repeats = int(edge_repeats)
+        self.cell_library = cell_library
+        self.leak_mode = leak_mode
+        self.interstage_activation = interstage_activation
+        self.freeze_read = bool(freeze_read)
+        self.boundary_fan_out = _parse_boundary_fan_out(boundary_fan_out)
+        self.enable_temporal_readout = bool(enable_temporal_readout)
+        self.num_targets = int(num_targets)
+        self.input_rail = float(input_rail)
+        self.x_max = float(x_max)
+        self.param_log_bounds = param_log_bounds
+        self._seed = int(seed if seed is not None else small_world_seed)
+
+        self.vca_enabled = bool(vca_enabled)
+        self.vca_rank = int(vca_rank) if vca_rank is not None else 2
+        if self.vca_enabled and self.vca_rank < vca_cfg_min_rank:
+            raise ValueError(
+                f"vca_rank must be >= {vca_cfg_min_rank}, got {self.vca_rank}")
+        self.vca_core_enabled = bool(vca_core_enabled)
+        self.vca_gate_shunt = bool(vca_gate_shunt)
+        self.vca_separate_core_bus = bool(vca_separate_core_bus)
+        self.vca_bias = bool(vca_bias)
+        self.gm_max = float(gm_max) if gm_max is not None else None
+        self.isat_max = float(isat_max) if isat_max is not None else None
+        self.learnable_clip_sharpness = bool(learnable_clip_sharpness)
+        self.clip_sharpness_init = (float(clip_sharpness_init)
+                                    if clip_sharpness_init is not None else None)
+        self.clip_sharpness_min = (float(clip_sharpness_min)
+                                   if clip_sharpness_min is not None else None)
+        self.clip_sharpness_max = (float(clip_sharpness_max)
+                                   if clip_sharpness_max is not None else None)
+        self.gln_rails = bool(gln_rails)
+        self.gln_B = int(gln_B)
+        self.gln_rank = int(gln_rank)
+        self.gln_alpha_init = float(gln_alpha_init)
+        self.gln_families = (str(gln_families)
+                             if gln_families is not None else None)
+        if kn_readout not in ("temporal", "shared", "shared-x2"):
+            raise ValueError(
+                f"kn_readout must be 'temporal', 'shared' or 'shared-x2', "
+                f"got {kn_readout!r}")
+        self.kn_readout = str(kn_readout)
+
+        self._mod = nn.Module()
+        self._mod.register_buffer(
+            "input_log_min",
+            torch_mod.as_tensor(np.asarray(input_log_min, dtype=np.float32)))
+        self._mod.register_buffer(
+            "input_log_max",
+            torch_mod.as_tensor(np.asarray(input_log_max, dtype=np.float32)))
+        self.log_lo = nn.Parameter(torch_mod.zeros(num_targets),
+                                   requires_grad=False)
+        self.log_hi = nn.Parameter(torch_mod.zeros(num_targets),
+                                   requires_grad=False)
+        for i, (name, (lo, hi)) in enumerate(param_log_bounds.items()):
+            self.log_lo.data[i] = lo
+            self.log_hi.data[i] = hi
+
+        t_span_stage = float(t_span_total) / self.num_stages
+        num_steps_stage = (int(stage_num_steps) if stage_num_steps is not None
+                           else max(1, int(round(70 / self.num_stages))))
+        cfg = {
+            "stages": [
+                {
+                    "num_inputs": 4,
+                    "num_hidden": num_hidden,
+                    "num_proj": 0,
+                    "num_outputs": 0,
+                    "hidden_family": "small_world",
+                    "hidden_kwargs": {
+                        "k": int(small_world_k),
+                        "p": float(small_world_p),
+                        "seed": int(small_world_seed),
+                        "bidirectional": False,
+                    },
+                    "input_pattern": "all_to_all",
+                    "output_pattern": "all_to_all",
+                    "proj_pattern": "all_to_all",
+                    "edge_repeats": int(edge_repeats),
+                    "t_span": float(t_span_stage),
+                    "num_steps": int(num_steps_stage),
+                }
+                for _ in range(self.num_stages)
+            ],
+            "out_dim": int(num_targets),
+            "write_mode": "sparse_proj",
+            "read_mode": "dense",
+            "use_robust_input": False,
+        }
+        cell_lib_template = make_cell_library(
+            cell_library, gm_max=self.gm_max, isat_max=self.isat_max)
+        _kn_readout_to_mode = {
+            "temporal": ("ota_mesh", 1),
+            "shared": ("shared_sense", 1),
+            "shared-x2": ("shared_sense", 2),
+        }
+        readout_mode, readout_senses = _kn_readout_to_mode[self.kn_readout]
+        self.net = build_net_from_config(
+            cfg,
+            cell_lib=cell_lib_template,
+            leak_mode=leak_mode,
+            freeze_read=freeze_read,
+            interstage_activation=interstage_activation,
+            boundary_fan_out=self.boundary_fan_out,
+            enable_temporal_readout=enable_temporal_readout,
+            readout_mode=readout_mode,
+            readout_senses_per_node=int(readout_senses),
+            learnable_clip_sharpness=self.learnable_clip_sharpness,
+            clip_sharpness_init=self.clip_sharpness_init,
+            clip_sharpness_min=self.clip_sharpness_min,
+            clip_sharpness_max=self.clip_sharpness_max,
+            gln_rails=self.gln_rails,
+            gln_B=self.gln_B,
+            gln_rank=self.gln_rank,
+            gln_alpha_init=self.gln_alpha_init,
+            gln_families=self.gln_families,
+            x_max=self.x_max,
+            vca_enabled=self.vca_enabled,
+            vca_rank=self.vca_rank,
+            vca_core_enabled=self.vca_core_enabled,
+            vca_gate_shunt=self.vca_gate_shunt,
+            vca_separate_core_bus=self.vca_separate_core_bus,
+            vca_bias=self.vca_bias,
+        )
+        self._clip_elements = 0
+        self._input_elements = 0
+
+    # -- nn.Module-compatible surface (delegated) -------------------------
+    def to(self, device):
+        self._mod = self._mod.to(device)
+        self.log_lo = self.log_lo.to(device)
+        self.log_hi = self.log_hi.to(device)
+        self.net = self.net.to(device)
+        return self
+
+    def eval(self):
+        self.net.eval()
+        return self
+
+    def parameters(self):
+        import itertools
+        return itertools.chain(self._mod.parameters(),
+                               nn_params(self.log_lo, self.log_hi),
+                               self.net.parameters())
+
+    def state_dict(self):
+        # Key layout mirrors the training-time nn.Module exactly:
+        # input_log_min / input_log_max (buffers), log_lo / log_hi
+        # (frozen parameters), net.* (fabric submodule).
+        sd = {
+            "input_log_min": self._mod.state_dict()["input_log_min"].cpu(),
+            "input_log_max": self._mod.state_dict()["input_log_max"].cpu(),
+            "log_lo": self.log_lo.detach().cpu(),
+            "log_hi": self.log_hi.detach().cpu(),
+        }
+        sd.update({f"net.{k}": v.cpu() for k, v in
+                   self.net.state_dict().items()})
+        return sd
+
+    def load_state_dict(self, state, strict=True):
+        """Load a training-time state dict (strict = drift detector)."""
+        torch_mod = self._torch
+        own = self.state_dict()
+        missing = [k for k in own if k not in state]
+        unexpected = [k for k in state if k not in own]
+        if strict and (missing or unexpected):
+            raise RuntimeError(
+                f"state_dict mismatch: missing={missing[:8]} "
+                f"unexpected={unexpected[:8]} "
+                f"(own={len(own)}, ckpt={len(state)}). The rebuilt topology "
+                f"does not match the checkpoint — check --kn-* flags.")
+        live = self._mod.state_dict()
+        live["input_log_min"].copy_(torch_mod.as_tensor(state["input_log_min"]))
+        live["input_log_max"].copy_(torch_mod.as_tensor(state["input_log_max"]))
+        with torch_mod.no_grad():
+            self.log_lo.copy_(torch_mod.as_tensor(state["log_lo"]))
+            self.log_hi.copy_(torch_mod.as_tensor(state["log_hi"]))
+        self.net.load_state_dict({k[4:]: v for k, v in state.items()
+                                  if k.startswith("net.")}, strict=strict)
+        return state
+
+    # -- forward API (mirrors training-time wrapper) -----------------------
+    def scale_input(self, x):
+        torch_mod = self._torch
+        eps = 1e-12
+        lo = self._mod.state_dict()["input_log_min"].to(x)
+        hi = self._mod.state_dict()["input_log_max"].to(x)
+        log_x = torch_mod.log10(x.clamp(min=eps))
+        span = (hi - lo).clamp(min=1e-8)
+        u = 2.0 * (log_x - lo) / span - 1.0
+        self._clip_elements += int((u.abs() >= self.input_rail).sum().item())
+        self._input_elements += int(u.numel())
+        return u.clamp(min=-self.input_rail, max=self.input_rail)
+
+    def forward(self, x):
+        u = self.scale_input(x)
+        logits, _trajs = self.net(u, store_trajectory=False, solver="heun")
+        return logits
+
+    def get_bounded_output(self, x):
+        torch_mod = self._torch
+        logits = self.forward(x)
+        probs = torch_mod.sigmoid(logits)
+        bounded_log = (self.log_lo.unsqueeze(0)
+                       + (self.log_hi.unsqueeze(0) - self.log_lo.unsqueeze(0))
+                       * probs)
+        physical = {name: torch_mod.pow(10.0, bounded_log[:, i])
+                    for i, name in enumerate(self.param_log_bounds.keys())}
+        return logits, bounded_log, physical
+
+
+def nn_params(*tensors):
+    for t in tensors:
+        yield t
+
+
+def load_knet_distill(args, specs_npz_data=None) -> KNetDistillWrapper:
+    """Rebuild the KNet student mirror from explicit flags + load state.
+
+    Raises SystemExit with an actionable message on any mismatch.
+    """
+    import torch
+    try:
+        from topology import build_net_from_config  # type: ignore
+        from cell_library import make_cell_library  # type: ignore
+        from config import VCA  # type: ignore
+    except Exception as e:
+        raise SystemExit(
+            f"[knet-distill] cannot import topology/cell_library/config: {e}. "
+            "Run from the kirchhoffnet_realistic directory.")
+    try:
+        raw = torch.load(args.ckpt, map_location="cpu", weights_only=True)
+    except Exception:
+        raw = torch.load(args.ckpt, map_location="cpu", weights_only=False)
+    state = (raw["state_dict"] if isinstance(raw, dict) and "state_dict" in raw
+             else raw)
+    if not isinstance(state, dict):
+        raise SystemExit(f"[knet-distill] {args.ckpt} is not a state dict")
+
+    # input_log bounds: explicit flags win, else canonical npz (same source
+    # the Phase-A trainer used), else hard fail (no silent defaults).
+    lo = getattr(args, "kn_input_log_min", None)
+    hi = getattr(args, "kn_input_log_max", None)
+    if lo is None or hi is None:
+        data = (specs_npz_data if specs_npz_data is not None
+                else getattr(args, "_specs_npz_data", None))
+        if (data is not None and "input_log_min" in data
+                and "input_log_max" in data):
+            lo = np.asarray(data["input_log_min"], dtype=np.float32)
+            hi = np.asarray(data["input_log_max"], dtype=np.float32)
+    if lo is None or hi is None:
+        raise SystemExit(
+            "[knet-distill] input_log bounds unavailable: pass "
+            "--kn-input-log-min/max or use a canonical --specs-npz carrying "
+            "input_log_min/max.")
+
+    vca_min_rank = 1
+    try:
+        vca_min_rank = int(VCA.get("min_rank", 1))
+    except Exception:
+        pass
+    try:
+        net = KNetDistillWrapper(
+            torch, build_net_from_config, make_cell_library, vca_min_rank,
+            num_stages=int(args.kn_num_stages),
+            num_hidden=int(args.kn_num_hidden),
+            small_world_k=int(args.kn_small_world_k),
+            small_world_p=float(args.kn_small_world_p),
+            small_world_seed=int(args.kn_small_world_seed),
+            edge_repeats=int(args.kn_edge_repeats),
+            cell_library=str(args.kn_cell_library),
+            leak_mode=str(args.kn_leak_mode),
+            interstage_activation=str(args.kn_interstage_activation),
+            freeze_read=bool(args.kn_freeze_read),
+            boundary_fan_out=args.kn_boundary_fan_out,
+            enable_temporal_readout=bool(args.kn_temporal_readout),
+            input_rail=float(args.kn_input_rail),
+            x_max=float(args.kn_x_max),
+            input_log_min=np.asarray(lo, dtype=np.float32),
+            input_log_max=np.asarray(hi, dtype=np.float32),
+            t_span_total=float(args.kn_t_span),
+            stage_num_steps=args.kn_stage_num_steps,
+            seed=int(args.kn_small_world_seed),
+            vca_enabled=bool(args.kn_vca_enabled),
+            vca_rank=int(args.kn_vca_rank),
+            vca_core_enabled=bool(args.kn_vca_core),
+            vca_gate_shunt=bool(args.kn_vca_gate_shunt),
+            vca_separate_core_bus=bool(args.kn_vca_separate_core_bus),
+            vca_bias=bool(args.kn_vca_bias),
+            gm_max=float(args.kn_gm_max),
+            isat_max=float(args.kn_isat_max),
+            kn_readout=str(args.kn_readout),
+            learnable_clip_sharpness=bool(args.kn_learnable_clip_sharpness),
+            clip_sharpness_init=args.kn_clip_sharpness_init,
+            clip_sharpness_min=args.kn_clip_sharpness_min,
+            clip_sharpness_max=args.kn_clip_sharpness_max,
+            gln_rails=bool(args.kn_gln_rails),
+            gln_B=int(args.kn_gln_B),
+            gln_rank=int(args.kn_gln_rank),
+            gln_alpha_init=float(args.kn_gln_alpha_init),
+            gln_families=str(args.kn_gln_families),
+        )
+    except (TypeError, ValueError) as e:
+        raise SystemExit(f"[knet-distill] rebuild failed: {e}")
+    try:
+        net.load_state_dict(state, strict=True)
+    except Exception as e:
+        raise SystemExit(f"[knet-distill] {e}")
+    net.to(args.device)
+    net.eval()
+    for p in net.parameters():
+        p.requires_grad = False
+    return net
+
+
+def predict_knet_distill(net: KNetDistillWrapper, specs: np.ndarray,
+                         device: str, batch_size: int = 64) -> np.ndarray:
+    """Forward the KNet mirror; return (N, 7) log10 params in PARAM_COLS order."""
+    import torch
+    out = np.zeros((specs.shape[0], len(PARAM_COLS)), dtype=np.float32)
+    for i in range(0, specs.shape[0], batch_size):
+        x = torch.from_numpy(specs[i:i + batch_size]).to(device)
+        with torch.no_grad():
+            _logits, bounded_log, _phys = net.get_bounded_output(x)
+        out[i:i + batch_size] = bounded_log.detach().cpu().numpy().astype(np.float32)
     return out
 
 
@@ -1010,13 +1733,26 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                              _mlp_use_layernorm=args.mlp_use_layernorm,
                              _input_preprocessing=args.input_preprocessing)
         params_log = predict_mlp(teacher, specs, args.device)
+    elif args.model_kind == "moe":
+        student = MoeStudent(args.ckpt,
+                             trunk_width=args.moe_trunk_width,
+                             trunk_layers=args.moe_trunk_layers,
+                             num_experts=args.moe_num_experts,
+                             activation=args.moe_activation,
+                             input_preprocessing=args.input_preprocessing)
+        student.load(args.device, args=args)
+        params_log = predict_moe(student, specs, args.device, args=args)
+    elif args.model_kind == "knet-distill":
+        net = load_knet_distill(args)
+        params_log = predict_knet_distill(net, specs, args.device)
     else:
+        # Bare 'knet' -> tell user to use --model-kind knet-distill + the
+        # explicit flags, or pre-bridge with --pred-params-csv.
         raise SystemExit(
-            "KNet checkpoints cannot be rebuilt by this script yet. "
-            "Pre-run inference yourself, save (N,7) log10 params in "
-            "PARAM_COLS order, and pass them via --pred-params-csv "
-            "(Stage-1 is then skipped; Ocean + scoring run normally). "
-            "--kn-config-json is reserved for a future auto-rebuild."
+            "--model-kind knet without the -distill suffix cannot auto-rebuild. "
+            "Use --model-kind knet-distill with explicit --kn-* flags (see "
+            "plan spice-model-loaders) OR pre-bridge via --pred-params-csv "
+            "(N,7) log-params in PARAM_COLS order."
         )
 
     # Save stage-1 outputs.
@@ -1041,6 +1777,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     manifest_template_sha = sha256_dir(args.template_dir)
     cli_serializable = {}
     for k, v in vars(args).items():
+        if k.startswith("_"):
+            continue  # private attrs (e.g. _specs_npz_data = live NpzFile)
         if isinstance(v, Path):
             cli_serializable[k] = str(v)
         elif isinstance(v, (list, tuple)):
