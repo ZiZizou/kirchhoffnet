@@ -237,11 +237,19 @@ net, _, _ = ne._build_fabric_net(
     compile_sequence=False,
 )
 override_log = npr.apply_gain_override(
-    net, gm_init=0.0, leak_mode="hetero:tau_lo=1.0,tau_hi=40.0",
+    net, gm_init=0.0, leak_mode="hetero:1.0:40.0",
     raw_leak_init_seed=7,
 )
 assert override_log["stage0_leak_mode"] == "programmable"
 assert "stage0_tau_median" in override_log
+# Malformed hetero tokens raise (colon form; commas would fracture at the
+# e0 grid splitter before ever reaching here).
+for _bad in ("hetero:1.0", "hetero:a:b", "hetero:40.0:1.0"):
+    try:
+        npr.apply_gain_override(net, gm_init=0.0, leak_mode=_bad)
+        raise AssertionError(f"expected ValueError on leak_mode={_bad!r}")
+    except ValueError:
+        pass
 # Bad leak mode string raises.
 try:
     npr.apply_gain_override(net, gm_init=0.0, leak_mode="unknown-mode")
@@ -328,19 +336,19 @@ print(f"AUDIT_K_DENSE_TRAINS_OK 1 epoch loss_history finite, "
 # argparse classifies a value starting with '-' as option-looking unless
 # it matches the negative-number regex; comma-joined grids like
 # "-5,-2,0,1.5" do NOT match, so they must travel in --flag=value form.
-# This audit runs the batch's e0 surface (explicit grids, hetero token,
-# small-world flag) as subprocesses so a CLI regression fails preflight
-# instead of a GPU allocation.
+# Separately, the hetero token must avoid commas (the grid splitter would
+# fracture it). This audit runs a MIXED grid where the hetero corner
+# actually executes -- a --max-corners prefix would stop before reaching
+# it, which is the coverage hole that let the 2026-09-12 bug through.
 _here = Path(".").resolve()
 for _sw in (False, True):
     with tempfile.TemporaryDirectory(prefix="audit_e0_cli_") as _tmp:
         _cmd = [
             sys.executable, "-B", "narma_advisor_probes.py", "e0",
             "--order", "10", "--seed", "0", "--device", "cpu",
-            "--gain-grid=-5,-2,0,1.5",
-            "--leak-grid=slow-fixed,hetero:tau_lo=1.0,tau_hi=40.0",
-            "--drive-grid=0.25,0.5,1.0",
-            "--max-corners", "1",
+            "--gain-grid=0.0",
+            "--leak-grid=slow-fixed,hetero:1.0:40.0",
+            "--drive-grid=0.5",
             "--n-streams", "1", "--train-samples", "300",
             "--jacobian-samples", "1",
             "--output", _tmp,
@@ -358,10 +366,15 @@ for _sw in (False, True):
         _summary = json.loads(
             (Path(_tmp) / "e0_sweep.json").read_text()
         )
-        assert _summary["n_corners"] == 1, (
+        assert _summary["n_corners"] == 2, (
             f"e0 CLI smoke (small_world={_sw}) corners: "
             f"{_summary['n_corners']}"
         )
-print("AUDIT_L_E0_CLI_SMOKE_OK torus+smallworld explicit grids parse and run")
+        _leaks = [r["leak_mode"] for r in _summary["rows"]]
+        assert any("hetero" in str(_m) for _m in _leaks), (
+            f"e0 CLI smoke (small_world={_sw}): hetero corner never ran: "
+            f"{_leaks}"
+        )
+print("AUDIT_L_E0_CLI_SMOKE_OK mixed grids parse; hetero corner executes")
 
 print("\nALL_AUDITS_OK")

@@ -529,16 +529,22 @@ def apply_gain_override(
             # The forward path picks up ``leak_constant`` instead.
         elif isinstance(leak_mode, str) and leak_mode.startswith("hetero:"):
             # Step 4 hook: hetero-leak init via log-uniform tau.
-            # Format: ``hetero:tau_lo=1,tau_hi=40`` (parsed below).
+            # Format: ``hetero:<tau_lo>:<tau_hi>`` (e.g.
+            # ``hetero:1.0:40.0``). Colons, NOT commas: the e0 CLI
+            # splits --leak-grid on commas, so a comma inside the token
+            # would fracture it into bogus modes (Alliance 2026-09-12:
+            # "unknown leak_mode 'tau_hi=40.0'"). Colons never appear in
+            # floats, so this form survives grid splitting intact.
             from narma_revised_plan import hetero_leak_init as _hetero
-            parts = leak_mode[len("hetero:"):].split(",")
-            kw: dict[str, float] = {}
-            for part in parts:
-                if "=" in part:
-                    k, v = part.split("=", 1)
-                    kw[k.strip()] = float(v)
-            tau_lo = float(kw.get("tau_lo", 1.0))
-            tau_hi = float(kw.get("tau_hi", 40.0))
+            _rest = leak_mode[len("hetero:"):]
+            try:
+                _lo_s, _hi_s = _rest.split(":")
+                tau_lo, tau_hi = float(_lo_s), float(_hi_s)
+            except ValueError:
+                raise ValueError(
+                    f"hetero leak_mode must be 'hetero:<tau_lo>:<tau_hi>', "
+                    f"got {leak_mode!r}"
+                )
             hl_log = _hetero(
                 stage, tau_lo=tau_lo, tau_hi=tau_hi,
                 seed=int(raw_leak_init_seed),
@@ -550,7 +556,7 @@ def apply_gain_override(
             except (TypeError, ValueError):
                 raise ValueError(
                     f"unknown leak_mode {leak_mode!r}; expected "
-                    "'slow-fixed' | 'randomized' | 'hetero:tau_lo=...,tau_hi=...' "
+                    "'slow-fixed' | 'randomized' | 'hetero:<tau_lo>:<tau_hi>' "
                     "| <numeric scalar>"
                 )
             stage.leak_mode = "non-programmable"
@@ -1171,8 +1177,9 @@ def main(argv: list[str] | None = None) -> int:
     p_e0.add_argument(
         "--leak-grid", type=str, default="slow-fixed,randomized,0.15",
         help="Comma-separated leak modes; numeric -> fixed scalar leak. "
-             "Step 4 hetero-leak token: 'hetero:tau_lo=1.0,tau_hi=40.0' "
-             "(per-node log-uniform time constants).",
+             "Step 4 hetero-leak token: 'hetero:1.0:40.0' (per-node "
+             "log-uniform time constants; colons, never commas, so the "
+             "token survives grid splitting).",
     )
     p_e0.add_argument("--drive-grid", type=str, default="0.25,0.5,1.0")
     p_e0.add_argument("--max-corners", type=int, default=0,
