@@ -527,13 +527,31 @@ def apply_gain_override(
             # the optimizer still updates; we leave it at the constructor
             # default so existing checkpoints load byte-identically.
             # The forward path picks up ``leak_constant`` instead.
+        elif isinstance(leak_mode, str) and leak_mode.startswith("hetero:"):
+            # Step 4 hook: hetero-leak init via log-uniform tau.
+            # Format: ``hetero:tau_lo=1,tau_hi=40`` (parsed below).
+            from narma_revised_plan import hetero_leak_init as _hetero
+            parts = leak_mode[len("hetero:"):].split(",")
+            kw: dict[str, float] = {}
+            for part in parts:
+                if "=" in part:
+                    k, v = part.split("=", 1)
+                    kw[k.strip()] = float(v)
+            tau_lo = float(kw.get("tau_lo", 1.0))
+            tau_hi = float(kw.get("tau_hi", 40.0))
+            hl_log = _hetero(
+                stage, tau_lo=tau_lo, tau_hi=tau_hi,
+                seed=int(raw_leak_init_seed),
+            )
+            log.update({f"stage{stage_idx}_{k}": v for k, v in hl_log.items()})
         else:
             try:
                 leak_val = float(leak_mode)
             except (TypeError, ValueError):
                 raise ValueError(
                     f"unknown leak_mode {leak_mode!r}; expected "
-                    "'slow-fixed' | 'randomized' | <numeric scalar>"
+                    "'slow-fixed' | 'randomized' | 'hetero:tau_lo=...,tau_hi=...' "
+                    "| <numeric scalar>"
                 )
             stage.leak_mode = "non-programmable"
             stage.leak_constant = leak_val
@@ -882,6 +900,10 @@ def e0_sweep(
     t_span: float = 1.0, num_steps: int = 8, hidden_dim: int = 25,
     net_factory: Any | None = None,
     selected_corners: Iterable[tuple[float, Any, float]] | None = None,
+    use_small_world: bool = False,
+    small_world_k: int = 4,
+    small_world_p: float = 0.2,
+    small_world_seed: int = 1,
 ) -> list[E0SweepRow]:
     """Run the locked E0 (zero-training) gain/leak/drive sweep.
 
@@ -903,6 +925,13 @@ def e0_sweep(
         selected_corners: Optional explicit ``(drive, leak, gm)`` list.
             Used by ``--max-corners`` so smoke runs take an exact prefix of
             the traversal order.
+        use_small_world: If True, build the NARMA net with
+            ``hidden_family='small_world'`` (Step 4 grid axis). Replaces
+            the canonical 5x5 torus with a Watts-Strogatz graph of the
+            same node count. Random-sign fan-out is NOT yet wired (plan
+            sec. 7 notes this can be added once a corner passes).
+        small_world_k / p / seed: Parameters of the Watts-Strogatz
+            graph. See ``narma_revised_plan.build_small_world_narma_preset``.
     """
     if n_streams < 1:
         raise ValueError(f"n_streams must be positive, got {n_streams}")
@@ -935,6 +964,52 @@ def e0_sweep(
     u_stream_raw = u_train_raw[0]
     y_stream_raw = y_train_raw[0]
 
+    # Resolve the default net factory: small_world preset when
+    # ``use_small_world`` is True, canonical torus otherwise. Both
+    # factories ignore their arguments and always rebuild via the seeded
+    # RNG so corner reproducibility holds (corners share the same seed).
+    if net_factory is None:
+        if use_small_world:
+            from topology import build_net_from_config
+            from cell_library import make_cell_library
+            from config import make_narma_preset as _make_narma_preset
+            from narma_revised_plan import build_small_world_narma_preset
+
+            def _small_world_factory() -> nn.Module:
+                preset = build_small_world_narma_preset(
+                    order=order, hidden_dim=hidden_dim,
+                    num_steps_per_sample=num_steps,
+                    t_span=t_span, small_world_k=small_world_k,
+                    small_world_p=small_world_p,
+                    small_world_seed=small_world_seed,
+                    core_refresh_interval=0,
+                    leak_constant=None,
+                )
+                torch.manual_seed(seed)
+                cell_lib = make_cell_library("tanh_free")
+                return build_net_from_config(
+                    cfg=preset, cell_lib=cell_lib,
+                    boundary_fan_out=preset["boundary_fan_out"],
+                    enable_temporal_readout=True,
+                    freeze_read=False,
+                )
+
+            net_factory = _small_world_factory
+        else:
+            def _torus_factory() -> nn.Module:
+                net, _t_span, _num_steps = ne._build_fabric_net(
+                    order=order, seed=seed, freeze_read=False,
+                    t_span=t_span, num_steps=num_steps,
+                    cell_library="tanh_free",
+                    hidden_dim=hidden_dim,
+                    core_refresh_interval=0,
+                    leak_constant=None,
+                    compile_sequence=False,
+                )
+                return net
+
+            net_factory = _torus_factory
+
     rows: list[E0SweepRow] = []
     scaled_cache: dict[float, torch.Tensor] = {}
     for drive, leak_mode, gm_init in corners:
@@ -948,18 +1023,7 @@ def e0_sweep(
         y_drive = y_stream_raw.to(device)
         # Build a fresh net for each corner so the overridden init is
         # reproducible and no corner inherits another corner's override.
-        if net_factory is not None:
-            net = net_factory()
-        else:
-            net, _t_span, _num_steps = ne._build_fabric_net(
-                order=order, seed=seed, freeze_read=False,
-                t_span=t_span, num_steps=num_steps,
-                cell_library="tanh_free",
-                hidden_dim=hidden_dim,
-                core_refresh_interval=0,
-                leak_constant=None,
-                compile_sequence=False,
-            )
+        net = net_factory()
         net.to(device)
         rows.append(_e0_row(
             net, u_drive, y_drive,
@@ -1106,12 +1170,21 @@ def main(argv: list[str] | None = None) -> int:
                       help="Comma-separated gm_init values (default -5,-2,0,1.5)")
     p_e0.add_argument(
         "--leak-grid", type=str, default="slow-fixed,randomized,0.15",
-        help="Comma-separated leak modes; numeric -> fixed scalar leak.",
+        help="Comma-separated leak modes; numeric -> fixed scalar leak. "
+             "Step 4 hetero-leak token: 'hetero:tau_lo=1.0,tau_hi=40.0' "
+             "(per-node log-uniform time constants).",
     )
     p_e0.add_argument("--drive-grid", type=str, default="0.25,0.5,1.0")
     p_e0.add_argument("--max-corners", type=int, default=0,
                       help="If >0, run exactly the first N corners in "
                            "drive/leak/gain traversal order (smoke).")
+    p_e0.add_argument("--use-small-world", action="store_true",
+                      help="Step 4 grid axis: build the NARMA net with "
+                           "hidden_family='small_world' instead of the "
+                           "canonical torus (same node count).")
+    p_e0.add_argument("--small-world-k", type=int, default=4)
+    p_e0.add_argument("--small-world-p", type=float, default=0.2)
+    p_e0.add_argument("--small-world-seed", type=int, default=1)
 
     args = parser.parse_args(argv)
     # Pre-registered thresholds and locked grids are NARMA-10-specific.
@@ -1247,6 +1320,10 @@ def main(argv: list[str] | None = None) -> int:
             t_span=args.t_span, num_steps=args.num_steps,
             hidden_dim=args.hidden_dim,
             selected_corners=selected_corners,
+            use_small_world=args.use_small_world,
+            small_world_k=args.small_world_k,
+            small_world_p=args.small_world_p,
+            small_world_seed=args.small_world_seed,
         )
         elapsed = time.time() - t0
         row_dicts = [asdict(r) for r in rows]
@@ -1256,13 +1333,13 @@ def main(argv: list[str] | None = None) -> int:
         hdr = (f"E0 sweep -- order={args.order} seed={args.seed} "
                f"{len(rows)} corners in {elapsed:.1f}s")
         lines = [
-            f"{'gm':>6} {'leak':>14} {'drive':>5} {'ridge':>7} "
+            f"{'gm':>6} {'leak':>28} {'drive':>5} {'ridge':>7} "
             f"{'mc':>6} {'sPR':>6} {'gzR':>7} {'gzMC':>6} "
             f"{'gzPR':>6} {'rail%':>6} {'pass':>4} {'gzpass':>6}",
         ]
         for r in rows:
             lines.append(
-                f"{r.gm_init:>6.2f} {r.leak_mode:>14} {r.drive:>5.2f} "
+                f"{r.gm_init:>6.2f} {r.leak_mode:>28} {r.drive:>5.2f} "
                 f"{r.ridge_nrmse:>7.4f} {r.mc_total_washout_corrected:>6.2f} "
                 f"{r.state_pr:>6.2f} {r.gate_zero_ridge_nrmse:>7.4f} "
                 f"{r.gate_zero_mc_total:>6.2f} {r.gate_zero_state_pr:>6.2f} "
@@ -1312,6 +1389,10 @@ def main(argv: list[str] | None = None) -> int:
                 "t_span": args.t_span,
                 "num_steps": args.num_steps,
                 "hidden_dim": args.hidden_dim,
+                "use_small_world": args.use_small_world,
+                "small_world_k": args.small_world_k,
+                "small_world_p": args.small_world_p,
+                "small_world_seed": args.small_world_seed,
             },
             "n_streams": args.n_streams,
             "train_samples": args.train_samples,

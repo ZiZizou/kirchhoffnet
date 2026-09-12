@@ -1496,6 +1496,7 @@ def _build_fabric_net(
     leak_constant: float | None,
     compile_sequence: bool,
     hidden_dim: int | None = None,
+    readout: str = "temporal",
 ) -> tuple[nn.Module, float, int]:
     """Build the NARMA fabric net (preset + topology + optional compile).
 
@@ -1504,6 +1505,20 @@ def _build_fabric_net(
     from the same arguments. Returns ``(net, t_span, num_steps)`` with
     CLI fallbacks resolved. ``hidden_dim=None`` preserves the canonical
     preset width; an explicit value selects another square torus width.
+
+    ``readout`` (Step 3 of the revised NARMA plan) selects the readout
+    family. ``"temporal"`` (legacy default) builds the OTA mesh + one
+    output-ODE accumulator + OutputAffine readout (the canonical path
+    for everything to date). ``"dense"`` drops the OTA mesh + accumulator
+    tail and replaces the OutputAffine with a plain dense linear
+    :class:`OutputMapper` over all hidden states (``hidden_dim + 1`` params
+    for NARMA-10: 25 weights + 1 bias). ``dense`` is the Step 3 readout
+    fix candidate -- it preserves the dynamics, discards the
+    accumulator-only channel, and exposes the full hidden state to a
+    single learned linear readout (highest value-per-effort lever per
+    the revised plan sec. 6). Training, evaluation, and state collection
+    paths already handle ``enable_temporal_readout=False``; the only
+    change here is preset override + the build call.
     """
     base = PRESET_NARMA20 if order == 20 else PRESET_NARMA10
     if t_span is None:
@@ -1522,13 +1537,52 @@ def _build_fabric_net(
     )
     cell_lib = make_cell_library(cell_library)
     torch.manual_seed(seed)
-    net = build_net_from_config(
-        cfg=preset,
-        cell_lib=cell_lib,
-        boundary_fan_out=preset["boundary_fan_out"],
-        enable_temporal_readout=True,
-        freeze_read=freeze_read,
-    )
+    if readout == "dense":
+        # Step 3 readout: drop the OTA mesh + accumulator tail, plain
+        # dense OutputMapper over hidden states. The preset's
+        # ``enable_temporal_readout=True`` / ``output_ode_count=1`` get
+        # overridden BEFORE the build so the OTA mesh + OutputAffine path
+        # is not constructed at all (cheaper net, 26 params for the
+        # readout instead of 200 mesh + 6 OutputAffine).
+        preset = dict(preset)  # shallow copy so the module-level
+                               # PRESET_NARMA10/20 stay untouched.
+        preset["enable_temporal_readout"] = False
+        preset["output_ode_count"] = 0
+        # ``read_mode='dense'`` flips the sparse read_idx path (the NARMA
+        # preset leaves it None, which silently builds a single-node
+        # readout under the sparse branch -- exactly what Step 3 is
+        # trying to replace). The dense branch reads from the full hidden
+        # state, which is the Step 3 spec.
+        preset["read_mode"] = "dense"
+        # Drop projection nodes too -- dense path reads hidden directly.
+        # NOTE: the stage dicts must be re-created, not edited in place:
+        # ``preset["stages"]`` is shared with the module-level
+        # PRESET_NARMA10/20 until reassigned, so in-place edits would leak
+        # into every later temporal build in this process.
+        preset["stages"] = [
+            dict(stage_cfg, num_proj=0, proj_pattern="none")
+            for stage_cfg in preset["stages"]
+        ]
+        net = build_net_from_config(
+            cfg=preset,
+            cell_lib=cell_lib,
+            boundary_fan_out=preset["boundary_fan_out"],
+            enable_temporal_readout=False,
+            freeze_read=freeze_read,
+        )
+    elif readout == "temporal":
+        net = build_net_from_config(
+            cfg=preset,
+            cell_lib=cell_lib,
+            boundary_fan_out=preset["boundary_fan_out"],
+            enable_temporal_readout=True,
+            freeze_read=freeze_read,
+        )
+    else:
+        raise ValueError(
+            f"_build_fabric_net: readout must be 'temporal' or 'dense', "
+            f"got {readout!r}"
+        )
     if compile_sequence:
         for stage in net.core.stages:
             stage.enable_sequence_compile()
@@ -1564,6 +1618,7 @@ def run_fabric_condition(
     mapper_lr_scale: float = 1.0,
     input_scale: float = 1.0,
     leak_constant: float | None = None,
+    readout: str = "temporal",
 ) -> dict[str, Any]:
     """Train one fabric condition and return its results.
 
@@ -1634,6 +1689,7 @@ def run_fabric_condition(
         t_span=t_span, num_steps=num_steps, cell_library=cell_library,
         core_refresh_interval=core_refresh_interval,
         leak_constant=leak_constant, compile_sequence=compile_sequence,
+        readout=readout,
     )
 
     # ---- (Optional) Ridge-on-frozen-states diagnostic BEFORE training ----
@@ -2086,6 +2142,16 @@ def parse_args() -> argparse.Namespace:
                              "--leak-constant/--input-scale) must match the "
                              "training run. Writes carry_ablation.csv/txt "
                              "into --output and exits.")
+    parser.add_argument("--readout", type=str, default="temporal",
+                        choices=["temporal", "dense"],
+                        help="Readout family (Step 3 of the revised NARMA plan). "
+                             "'temporal' (default, legacy) builds the OTA mesh + "
+                             "one output-ODE accumulator + OutputAffine. 'dense' "
+                             "drops the mesh + accumulator tail and replaces "
+                             "OutputAffine with a plain dense linear OutputMapper "
+                             "over all hidden states (26 params for NARMA-10). "
+                             "'dense' is the readout-rank fix candidate (plan sec. 6); "
+                             "the OTA dynamics are unchanged either way.")
     return parser.parse_args()
 
 
@@ -2109,7 +2175,7 @@ def _write_partial_tables(
         f"NARMA-{order} -- {len(seeds)} seeds -- final results",
         "=" * 60,
     ]
-    csv_lines = ["condition,seed,nrmse,r2,mc_total,trained_params,total_params,hidden_dim,cell_library,core_refresh_interval,cell_lib_evals_per_sample"]
+    csv_lines = ["condition,seed,nrmse,r2,mc_total,trained_params,total_params,hidden_dim,cell_library,core_refresh_interval,cell_lib_evals_per_sample,readout"]
     for cond in sorted(by_cond):
         runs = by_cond[cond]
         nrmse_vals = [r["nrmse"] for r in runs]
@@ -2155,7 +2221,8 @@ def _write_partial_tables(
                 f"{tt if tt != '' else ''},{hd if hd != '' else ''},"
                 f"{r.get('cell_library', '')},"
                 f"{r.get('core_refresh_interval', '')},"
-                f"{r.get('cell_lib_evals_per_sample', '')}"
+                f"{r.get('cell_lib_evals_per_sample', '')},"
+                f"{r.get('readout', '')}"
             )
 
     summary_text = "\n".join(summary_lines) + "\n"
@@ -2287,10 +2354,18 @@ def main() -> int:
             )
             init_from = None
         for idx, (refresh_k, seed) in enumerate(fabric_jobs, 1):
-            cond_name = f"fabric_refresh_k{refresh_k}"
+            # Readout-suffixed condition name FIRST so the checkpoint file,
+            # the log line, and the results table all agree (a dense run
+            # must not overwrite a temporal checkpoint of the same (k, seed)).
+            cond_name = (
+                f"fabric_refresh_k{refresh_k}_{args.readout}"
+                if args.readout != "temporal"
+                else f"fabric_refresh_k{refresh_k}"
+            )
             print(f"  [{idx}/{len(fabric_jobs)}] {cond_name}  seed={seed}  "
                 f"core_refresh_interval={refresh_k}  "
                 f"cell_library={args.cell_library}  "
+                f"readout={args.readout}  "
                 f"freeze_read=False (evolving core)")
             ckpt_path = out_dir / f"{cond_name}_seed{seed}.pt"
             res = run_fabric_condition(
@@ -2317,6 +2392,7 @@ def main() -> int:
                 mapper_lr_scale=args.mapper_lr_scale,
                 input_scale=args.input_scale,
                 leak_constant=args.leak_constant,
+                readout=args.readout,
             )
             result_row = {
                 "seed": seed,
@@ -2332,6 +2408,7 @@ def main() -> int:
                 "cell_lib_evals_per_sample": (
                     max(1, (args.num_steps + refresh_k - 1) // refresh_k)
                 ),
+                "readout": args.readout,
             }
             if "ridge_nrmse" in res:
                 result_row["ridge_nrmse"] = res["ridge_nrmse"]

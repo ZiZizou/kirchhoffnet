@@ -31,15 +31,13 @@ Pulled-and-run flow on ssr0
         --template-dir /home/annaik/Documents/train_ctle/ocn_template_ideal_bob \
         --enable-ocean
 
-KNet / external bridge (no auto-rebuild yet)
---------------------------------------------
-    # 1. Run your own inference -> (N,7) log10 params in PARAM_COLS order:
-    #    pred_params_log.csv  (header: fW,current,ind,Rd,Cs,Rs,VDD)
-    # 2. python spice_failure_check.py --model-kind knet --ckpt <trial_ckpt> \
-    #        --specs-npz $CANONICAL --n-specs 50 \
-    #        --pred-params-csv pred_params_log.csv \
-    #        --work-root ~/simulation/SPICE_failure \
-    #        --template-dir .../ocn_template_ideal_bob --enable-ocean
+KNet / MoE / external bridge
+------------------------------
+    # --model-kind knet-distill rebuilds the KNet DAgger student from explicit
+    # --kn-* flags (defaults mirror trial_0011) + phase_a_best.pt.
+    # --model-kind moe loads a RegimeAwareMoE (defaults mirror trial_0024).
+    # --pred-params-csv <csv> skips Stage-1 entirely for any other model:
+    # (N,7) log10 params in PARAM_COLS order (header fW,current,ind,Rd,Cs,Rs,VDD).
 """
 
 from __future__ import annotations
@@ -84,8 +82,13 @@ SPEC_INPUT_COLS = ["power", "stage_2_jitter", "stage_2_eye_max_height",
                    "stage_2_eye_max_width"]
 
 # Default measured-spec -> target-spec key map (56G stage-2).
+# IMPORTANT: ocn_template_ideal_bob/template_*.ocn uses ?name "power"
+# (lowercase) — see for example template_1.ocn:59 "(VAR(\"current\") *
+# 4 * VAR(\"VDD\"))" ?name "power" ?evalType 'point. Bob's reference flow
+# reads it via ocean_creation.read_csv_data(...).get("power") (lowercase).
+# All other dims match the template's ?name verbatim.
 DEFAULT_KEY_MAP = {
-    "power":   "Power",
+    "power":   "power",
     "jitter":  "eye_p2pJitterAverage_norm stage 2",
     "height":  "eye_maxHeight_norm Vout_2 56G",
     "width":   "eye_maxWidth_norm Vout_2 56G",
@@ -259,7 +262,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--min-degraded-dims", type=int, default=2,
                    help="Number of dims that must degrade to count a spec as failure.")
     p.add_argument("--key-map", default=None,
-                   help='JSON dict {"power":"Power","jitter":"...",...} overriding defaults.')
+                   help='JSON dict {"power":"power","jitter":"...",...} overriding defaults.')
 
     # ----- modes -----
     p.add_argument("--dry-run", action="store_true",
@@ -268,6 +271,12 @@ def build_parser() -> argparse.ArgumentParser:
                    help="Force n-specs=2, 1 TB, dry-run by default. For local smoke tests.")
     p.add_argument("--offline-csv", type=Path, default=None,
                    help="Re-score an existing results.csv without running anything.")
+    p.add_argument("--score-run-dir", type=Path, default=None,
+                   help="Score a finished/partial run directory in place "
+                        "(e.g. <work-root>/<run-tag>): walks spec_*/{parsed,"
+                        "target}.json, scores finished specs only, writes "
+                        "results.csv + summary.json. Zero Ocean calls; "
+                        "refuses _mocked entries unless --score-force-mocked.")
     p.add_argument("--resume", dest="resume", action="store_true", default=True,
                    help="Skip specs with valid parsed.json (default).")
     p.add_argument("--no-resume", dest="resume", action="store_false",
@@ -277,6 +286,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--mock-template", action="store_true",
                    help="Synthesize a minimal template_{tb}.ocn under --template-dir "
                         "when real templates are absent (local dry-run only).")
+    p.add_argument("--score-force-mocked", action="store_true",
+                   help="Include _mocked parsed.json entries when using "
+                        "--score-run-dir. Default refuses them.")
 
     p.add_argument("--log-level", default="INFO")
     return p
@@ -334,7 +346,11 @@ def load_specs(args: argparse.Namespace) -> np.ndarray:
             raise SystemExit(
                 f"[specs] --n-specs {args.n_specs} exceeds pool size {n}; "
                 f"raise --n-specs or drop --specs-idx-key.")
-        offset = max(0, min(args.spec_offset, n - 1))
+        offset = max(0, args.spec_offset)
+        if offset + args.n_specs > n:
+            raise SystemExit(
+                f"[specs] --spec-offset {offset} + --n-specs {args.n_specs} "
+                f"exceeds pool size {n}; would silently return fewer specs.")
         rng = np.random.default_rng(args.seed)
         idx = np.arange(n)
         rng.shuffle(idx)
@@ -1262,7 +1278,13 @@ def write_spec_ocn(template_dir: Path, tb_idx: int, var_map: dict,
 
 
 def run_simulation(ocn_file: Path, cwd: Path, pdk_source: str,
-                   ocean_bin: str = "ocean", timeout: int = 600) -> float:
+                   ocean_bin: str = "ocean", timeout: int = 600) -> tuple:
+    """Launch one Ocean sim. Returns (runtime_seconds, returncode).
+
+    runtime is -1.0 on timeout (returncode None). The caller's wait/poll
+    uses the returncode for diagnostics; a nonzero rc with a present
+    result.csv still parses (partial export), a missing file is an error.
+    """
     wrapper = cwd / "run_ocean.csh"
     ocn_posix = ocn_file.as_posix() if isinstance(ocn_file, Path) else str(ocn_file).replace("\\", "/")
     wrapper.write_text(
@@ -1278,7 +1300,7 @@ def run_simulation(ocn_file: Path, cwd: Path, pdk_source: str,
     wrapper.chmod(0o755)
     t0 = time.time()
     try:
-        subprocess.run(
+        proc = subprocess.run(
             ["/bin/csh", str(wrapper)],
             cwd=str(cwd),
             capture_output=True,
@@ -1287,8 +1309,12 @@ def run_simulation(ocn_file: Path, cwd: Path, pdk_source: str,
         )
     except subprocess.TimeoutExpired:
         logger.warning("ocean timeout after %ds on %s", timeout, ocn_file)
-        return -1.0
-    return time.time() - t0
+        return -1.0, None
+    if proc.returncode != 0:
+        logger.warning("ocean rc=%s on %s (stderr tail: %s)",
+                       proc.returncode, ocn_file,
+                       (proc.stderr or "")[-500:])
+    return time.time() - t0, proc.returncode
 
 
 def _wait_for_csv(path: Path, timeout: int, interval: float = 5.0) -> bool:
@@ -1387,15 +1413,16 @@ ocnxlEndXLMode("assembler")
 
 # Mocked parser used by --smoke / local mode without Cadence.
 def _mocked_parser(idx: int, target_spec: np.ndarray) -> dict:
-    """Deterministic stand-in: returns the target as the 'measured' value
-    for power/jitter (no degradation) and 80% of target for height/width
-    (mild degradation). One spec in 5 has an error injection."""
+    """Deterministic stand-in: power x1.05 / jitter x1.03 (below the 0.10
+    degrade gate), height x0.78 / width x0.85 (both degraded, so the mocked
+    spec fails with degraded_dims=2). Keys MUST match DEFAULT_KEY_MAP
+    exactly (lowercase "power"). One spec in 5 has an error injection."""
     is_err = (idx % 5 == 4)
     if is_err:
         return {"_error": 1}
     p, j, h, w = (float(x) for x in target_spec)
     return {
-        "Power": p * 1.05,
+        "power": p * 1.05,
         "eye_p2pJitterAverage_norm stage 2": j * 1.03,
         "eye_maxHeight_norm Vout_2 56G": h * 0.78,
         "eye_maxWidth_norm Vout_2 56G": w * 0.85,
@@ -1427,18 +1454,35 @@ def _ocean_worker(spec_idx: int, spec: np.ndarray, params_log: np.ndarray,
     ocn_path = spec_dir / "spec.ocn"
     ocn_path.write_text(ocn_text, encoding="utf-8")
 
+    # Delete any stale result.csv FIRST, on every (re)run path: otherwise
+    # _wait_for_csv would accept the previous run's file and score stale
+    # measurements (e.g. after --no-resume with changed params), and a
+    # leftover file would mislead --dump-keys on mocked runs.
+    stale = spec_dir / "result.csv"
+    try:
+        if stale.exists():
+            stale.unlink()
+    except OSError as e:
+        logger.warning("[%s] could not remove stale result.csv: %s",
+                       spec_dir.name, e)
+
     if not do_launch:
         parsed = _mocked_parser(spec_idx, spec)
         parsed["_mocked"] = True
     else:
         if do_history_delete:
             _delete_maestro_history(tb_idx)
-        run_simulation(ocn_path, spec_dir, pdk_source,
-                       ocean_bin=ocean_bin, timeout=sim_timeout)
-        if not _wait_for_csv(spec_dir / "result.csv", timeout=sim_timeout):
+        runtime, rc = run_simulation(ocn_path, spec_dir, pdk_source,
+                                     ocean_bin=ocean_bin, timeout=sim_timeout)
+        if runtime < 0:
             parsed = {"_error": 1, "_reason": "timeout"}
+        elif not _wait_for_csv(spec_dir / "result.csv", timeout=sim_timeout):
+            parsed = {"_error": 1, "_reason": "timeout",
+                      "_ocean_rc": rc}
         else:
             parsed = _parse_ctle_csv(spec_dir / "result.csv")
+            if rc not in (0, None):
+                parsed["_ocean_rc"] = rc
     (spec_dir / "parsed.json").write_text(json.dumps(parsed, indent=2))
     return parsed
 
@@ -1447,12 +1491,20 @@ def _worker_entry(payload: tuple) -> dict:
     (spec_idx, spec, params_log, tb_idx, spec_dir_str, template_dir_str,
      pdk_source, sim_timeout, ocean_bin, do_launch, do_history_delete,
      mock_template) = payload
-    return _ocean_worker(
-        spec_idx, spec, params_log, tb_idx,
-        Path(spec_dir_str), Path(template_dir_str), pdk_source,
-        sim_timeout, ocean_bin, do_launch, do_history_delete,
-        mock_template=mock_template,
-    )
+    try:
+        return _ocean_worker(
+            spec_idx, spec, params_log, tb_idx,
+            Path(spec_dir_str), Path(template_dir_str), pdk_source,
+            sim_timeout, ocean_bin, do_launch, do_history_delete,
+            mock_template=mock_template,
+        )
+    except Exception as e:
+        # One bad spec (missing template, bad params, disk error) must not
+        # kill the other N-1 sims in a paid Ocean run. Deliberately write NO
+        # parsed.json so (a) Stage-3 of THIS run counts it as failed, and
+        # (b) a later --resume retries it instead of skipping.
+        logger.warning("[spec_%05d] worker failed: %r", spec_idx, e)
+        return {"_error": 1, "_reason": f"worker: {type(e).__name__}: {e}"}
 
 
 # ---------------------------------------------------------------------------
@@ -1507,7 +1559,6 @@ def score_spec(target: np.ndarray, measured: dict, key_map: dict,
             errs[dim] = float("inf")
             degraded.append(True)
             continue
-        v = v
         if v <= 0.0:
             measured_ok = False
             pred[dim] = float("nan")
@@ -1669,6 +1720,70 @@ def run_offline_score(args: argparse.Namespace) -> int:
     return 0
 
 
+def run_score_run_dir(args: argparse.Namespace) -> int:
+    """Score a finished/partial run dir in place. Zero Ocean calls.
+
+    Walks spec_*/parsed.json + target.json. Pending specs (missing either
+    file) are EXCLUDED from numerator and denominator per user decision.
+    Refuses _mocked entries unless --score-force-mocked is set.
+    """
+    run_dir = Path(os.path.expanduser(str(args.score_run_dir)))
+    if not run_dir.exists():
+        raise SystemExit(f"[score-run-dir] {run_dir} does not exist")
+    if not run_dir.is_dir():
+        raise SystemExit(f"[score-run-dir] {run_dir} is not a directory")
+    key_map = parse_key_map(args.key_map)
+    args.key_map_dict = key_map
+    rows = []
+    pending = []
+    refused_mocked = 0
+    spec_dirs = sorted(run_dir.glob("spec_*"))
+    for spec_dir in spec_dirs:
+        try:
+            spec_idx = int(spec_dir.name.split("_")[1])
+        except (IndexError, ValueError):
+            logger.warning("[score-run-dir] %s: not a spec_NNNNN dir; "
+                           "counting as pending", spec_dir.name)
+            pending.append(spec_dir.name)
+            continue
+        parsed_path = spec_dir / "parsed.json"
+        target_path = spec_dir / "target.json"
+        if not (parsed_path.exists() and target_path.exists()):
+            pending.append(spec_dir.name)
+            continue
+        try:
+            parsed = json.loads(parsed_path.read_text())
+            target = json.loads(target_path.read_text())
+        except Exception as e:
+            logger.warning("[score-run-dir] %s: skipping (bad json: %s)",
+                           spec_dir.name, e)
+            continue
+        if parsed.get("_mocked") and not args.score_force_mocked:
+            refused_mocked += 1
+            continue
+        spec_arr = np.array([
+            float(target["power"]),
+            float(target["stage_2_jitter"]),
+            float(target["stage_2_eye_max_height"]),
+            float(target["stage_2_eye_max_width"]),
+        ], dtype=np.float32)
+        sc = score_spec(spec_arr, parsed, key_map,
+                         args.degrade_thr, args.min_degraded_dims)
+        sc["idx"] = spec_idx
+        rows.append(sc)
+    rows.sort(key=lambda r: r["idx"])
+    results_csv = run_dir / "results.csv"
+    write_results_csv(rows, results_csv)
+    summary = summarize(rows, args, ckpt_sha="n/a", template_sha="n/a")
+    summary["n_done"] = len(rows)
+    summary["n_pending"] = len(pending)
+    summary["n_refused_mocked"] = refused_mocked
+    summary["scoring_mode"] = "finished-only"
+    (run_dir / "summary.json").write_text(json.dumps(summary, indent=2))
+    print(json.dumps(summary, indent=2))
+    return 0
+
+
 def run_dump_keys(args: argparse.Namespace) -> int:
     if args.run_tag is None:
         raise SystemExit("[dump-keys] requires --run-tag")
@@ -1698,6 +1813,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     if args.offline_csv is not None:
         return run_offline_score(args)
+    if args.score_run_dir is not None:
+        return run_score_run_dir(args)
     if args.dump_keys:
         return run_dump_keys(args)
 
