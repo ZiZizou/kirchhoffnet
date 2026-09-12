@@ -377,4 +377,92 @@ for _sw in (False, True):
         )
 print("AUDIT_L_E0_CLI_SMOKE_OK mixed grids parse; hetero corner executes")
 
+# --- M. e0 corner-level resume -------------------------------------------
+# A killed sweep must resume instead of restarting: pass 1 runs a 2-corner
+# prefix with progress tracking, pass 2 runs the full 4-corner grid into
+# the same progress file and must execute only the 2 missing corners,
+# pass 3 flips the topology (build-flag mismatch) and must rerun all 4.
+_m_drives = (0.5, 1.0)
+_m_leaks: list = ["slow-fixed", "hetero:1.0:40.0"]
+_m_gains = (0.0,)
+_m_prefix = npr._select_corner_subset(_m_drives, _m_leaks, _m_gains, 2)
+assert len(_m_prefix) == 2
+_m_kwargs: dict = dict(
+    order=10, seed=0, device="cpu",
+    gain_grid=_m_gains, leak_grid=_m_leaks, drive_grid=_m_drives,
+    n_streams=1, train_samples_per_stream=300,
+    washout=50, jacobian_samples=1,
+)
+_m_orig_e0_row = npr._e0_row
+
+
+def _make_counter() -> tuple[list, object]:
+    _hits: list = []
+
+    def _counting(*a, **k):  # type: ignore[no-untyped-def]
+        _hits.append(1)
+        return _m_orig_e0_row(*a, **k)
+
+    return _hits, _counting
+
+
+with tempfile.TemporaryDirectory(prefix="audit_e0_resume_") as _tmp:
+    _prog = Path(_tmp) / "e0_progress.json"
+    _rows1 = npr.e0_sweep(
+        **_m_kwargs, selected_corners=_m_prefix, progress_json=_prog,
+    )
+    assert len(_rows1) == 2, f"resume pass 1 rows: {len(_rows1)}"
+    _p1 = json.loads(_prog.read_text())
+    # Per-corner writes carry complete:false; the clean finish of this
+    # 2-corner invocation flips it to true. (A killed sweep would leave
+    # complete:false with n_done < total -- the resume trigger.)
+    assert _p1["complete"] is True and _p1["n_corners_done"] == 2, (
+        f"resume progress after pass 1: {_p1.get('complete')}, "
+        f"{_p1.get('n_corners_done')}"
+    )
+    assert _p1["n_corners_total"] == 2
+    assert [r["config_tag"] for r in _p1["rows"]] == [
+        r.config_tag for r in _rows1
+    ]
+    _hits2, _counting2 = _make_counter()
+    npr._e0_row = _counting2  # type: ignore[method-assign]
+    try:
+        _rows2 = npr.e0_sweep(**_m_kwargs, progress_json=_prog)
+    finally:
+        npr._e0_row = _m_orig_e0_row  # type: ignore[method-assign]
+    assert len(_rows2) == 4, f"resume pass 2 rows: {len(_rows2)}"
+    assert len(_hits2) == 2, (
+        f"resume pass 2 must execute exactly the 2 missing corners, "
+        f"ran {len(_hits2)}"
+    )
+    _full_tags = [
+        npr._e0_config_tag(
+            order=10, seed=0, device="cpu", hidden_dim=25, refresh=0,
+            t_span=1.0, num_steps=8, gm_init=0.0, leak_mode=m,
+            drive=d, washout=50, jacobian_samples=1,
+        )
+        for d in _m_drives for m in _m_leaks for _ in _m_gains
+    ]
+    assert [r.config_tag for r in _rows2] == _full_tags, "resume row order/tags"
+    assert _rows2[0].ridge_nrmse == _rows1[0].ridge_nrmse, "resumed rows stable"
+    _p2 = json.loads(_prog.read_text())
+    assert _p2["complete"] is True and _p2["n_corners_done"] == 4
+    # Pass 3: topology flip -> build mismatch -> full rerun, and the
+    # progress file now records the small-world build.
+    _hits3, _counting3 = _make_counter()
+    npr._e0_row = _counting3  # type: ignore[method-assign]
+    try:
+        _rows3 = npr.e0_sweep(
+            **_m_kwargs, progress_json=_prog, use_small_world=True,
+        )
+    finally:
+        npr._e0_row = _m_orig_e0_row  # type: ignore[method-assign]
+    assert len(_rows3) == 4, f"resume pass 3 rows: {len(_rows3)}"
+    assert len(_hits3) == 4, (
+        f"build mismatch must rerun all 4 corners, ran {len(_hits3)}"
+    )
+    _p3 = json.loads(_prog.read_text())
+    assert _p3["build"]["use_small_world"] is True
+print("AUDIT_M_E0_RESUME_OK prefix-resume exact; build-mismatch reruns")
+
 print("\nALL_AUDITS_OK")

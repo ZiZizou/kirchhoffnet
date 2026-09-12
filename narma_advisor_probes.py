@@ -36,6 +36,7 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import os
 import sys
 import time
 from dataclasses import asdict, dataclass
@@ -771,6 +772,51 @@ def _select_corner_subset(
     return full[:max_corners]
 
 
+def _e0_config_tag(
+    *, order: int, seed: int, device: str, hidden_dim: int, refresh: int,
+    t_span: float, num_steps: int, gm_init: float, leak_mode: Any,
+    drive: float, washout: int, jacobian_samples: int,
+) -> str:
+    """Corner identity shared by :func:`_e0_row` and the resume matcher.
+
+    Byte-identical to the historical tag format: progress files written
+    by older runs match only if this string is unchanged, so do not
+    restyle it (add new axes as suffixes only).
+    """
+    return (
+        f"order{order}_seed{seed}_{device}_tanhfree"
+        f"_h{int(hidden_dim)}_k{int(refresh)}"
+        f"_tspan{float(t_span):g}_steps{int(num_steps)}"
+        f"_gm{float(gm_init):g}_leak{leak_mode}_drive{float(drive):g}"
+        f"_washout{int(washout)}_jac{int(jacobian_samples)}"
+    )
+
+
+def _write_e0_progress(path: Path, payload: dict[str, Any]) -> None:
+    """Write the e0 progress file atomically (temp + os.replace).
+
+    A kill can never leave a truncated progress file behind: readers see
+    either the previous complete write or the new one.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(json.dumps(payload, indent=2))
+    os.replace(tmp, path)
+
+
+def _read_e0_progress(path: Path) -> dict[str, Any] | None:
+    """Load a progress file, or None when missing/corrupt.
+
+    Corrupt (killed-mid-write without atomic replace, hand-edited) files
+    fail safe: the sweep reruns everything instead of trusting garbage.
+    """
+    try:
+        data = json.loads(path.read_text())
+    except (OSError, ValueError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
 def _e0_row(
     net: nn.Module, u_train: torch.Tensor, y_train: torch.Tensor, *,
     order: int, seed: int, device: str,
@@ -849,12 +895,12 @@ def _e0_row(
     n_params = sum(
         p.numel() for p in net.parameters() if p.requires_grad
     )
-    config_tag = (
-        f"order{order}_seed{seed}_{device}_tanhfree"
-        f"_h{hidden_dim}_k{int(stage.core_refresh_interval)}"
-        f"_tspan{t_span:g}_steps{num_steps}"
-        f"_gm{float(gm_init):g}_leak{leak_mode}_drive{float(drive):g}"
-        f"_washout{washout}_jac{jacobian_samples}"
+    config_tag = _e0_config_tag(
+        order=order, seed=seed, device=device, hidden_dim=hidden_dim,
+        refresh=int(stage.core_refresh_interval),
+        t_span=t_span, num_steps=num_steps,
+        gm_init=gm_init, leak_mode=leak_mode, drive=drive,
+        washout=washout, jacobian_samples=jacobian_samples,
     )
     return E0SweepRow(
         config_tag=config_tag,
@@ -910,6 +956,7 @@ def e0_sweep(
     small_world_k: int = 4,
     small_world_p: float = 0.2,
     small_world_seed: int = 1,
+    progress_json: Path | str | None = None,
 ) -> list[E0SweepRow]:
     """Run the locked E0 (zero-training) gain/leak/drive sweep.
 
@@ -938,6 +985,13 @@ def e0_sweep(
             sec. 7 notes this can be added once a corner passes).
         small_world_k / p / seed: Parameters of the Watts-Strogatz
             graph. See ``narma_revised_plan.build_small_world_narma_preset``.
+        progress_json: Optional path to a progress file. After every
+            corner the rows-so-far are flushed there (``complete: false``);
+            on entry, corners whose ``config_tag`` is already present are
+            skipped, so a killed sweep resumes instead of restarting. A
+            build-flag mismatch (or a custom ``net_factory``) disables
+            resume -- rerunning is always the safe direction. ``None``
+            (default) disables progress tracking entirely.
     """
     if n_streams < 1:
         raise ValueError(f"n_streams must be positive, got {n_streams}")
@@ -974,6 +1028,9 @@ def e0_sweep(
     # ``use_small_world`` is True, canonical torus otherwise. Both
     # factories ignore their arguments and always rebuild via the seeded
     # RNG so corner reproducibility holds (corners share the same seed).
+    # Capture custom-factory status BEFORE resolution: a caller-supplied
+    # factory has an opaque build, so it disables progress resume below.
+    _allow_resume = net_factory is None
     if net_factory is None:
         if use_small_world:
             from topology import build_net_from_config
@@ -1016,9 +1073,81 @@ def e0_sweep(
 
             net_factory = _torus_factory
 
+    # Corner-level resume. Corners are pure functions of (seed, grid,
+    # build flags), matched by config_tag, so skipping completed corners
+    # is exact. Resume is keyed on the build flags below: any mismatch
+    # (different topology, geometry, or protocol) ignores the progress
+    # file and reruns everything. A custom net_factory also disables
+    # resume -- its build is opaque, so rerunning is the safe direction.
+    _progress_path = Path(progress_json) if progress_json is not None else None
+    _build_key: dict[str, Any] = {
+        "cell_library": "tanh_free",
+        "freeze_read": False,
+        "core_refresh_interval": 0,
+        "use_small_world": bool(use_small_world),
+        "small_world_k": int(small_world_k),
+        "small_world_p": float(small_world_p),
+        "small_world_seed": int(small_world_seed),
+        "hidden_dim": int(hidden_dim),
+        "t_span": float(t_span),
+        "num_steps": int(num_steps),
+        "washout": int(washout),
+        "jacobian_samples": int(jacobian_samples),
+    }
+    _done: dict[str, dict[str, Any]] = {}
+    if _progress_path is not None and _allow_resume:
+        _saved = _read_e0_progress(_progress_path)
+        if (
+            _saved is not None
+            and _saved.get("build") == _build_key
+            and isinstance(_saved.get("rows"), list)
+        ):
+            for _rd in _saved["rows"]:
+                if isinstance(_rd, dict) and "config_tag" in _rd:
+                    _done[str(_rd["config_tag"])] = _rd
+
+    def _progress_payload(
+        _rows: list[E0SweepRow], *, complete: bool,
+    ) -> dict[str, Any]:
+        def _leak_json(v: Any) -> Any:
+            return v if isinstance(v, (int, float, str)) else str(v)
+
+        return {
+            "order": order,
+            "seed": seed,
+            "device": device,
+            "build": _build_key,
+            "grids": {
+                "gain": [float(g) for _, _, g in corners],
+                "leak": [_leak_json(m) for _, m, _ in corners],
+                "drive": [float(d) for d, _, _ in corners],
+            },
+            "n_corners_total": len(corners),
+            "n_corners_done": len(_rows),
+            "complete": complete,
+            "rows": [asdict(r) for r in _rows],
+        }
+
     rows: list[E0SweepRow] = []
     scaled_cache: dict[float, torch.Tensor] = {}
     for drive, leak_mode, gm_init in corners:
+        _tag = _e0_config_tag(
+            order=order, seed=seed, device=device, hidden_dim=hidden_dim,
+            refresh=0, t_span=t_span, num_steps=num_steps,
+            gm_init=float(gm_init), leak_mode=leak_mode,
+            drive=float(drive), washout=washout,
+            jacobian_samples=jacobian_samples,
+        )
+        if _allow_resume and _tag in _done:
+            try:
+                rows.append(E0SweepRow(**_done[_tag]))
+            except TypeError:
+                # Schema drift between the run that wrote the progress
+                # file and this code: rerun the corner instead of
+                # trusting a row we cannot reconstruct.
+                pass
+            else:
+                continue
         drive_value = float(drive)
         if drive_value not in scaled_cache:
             scaled_cache[drive_value] = ne._scale_drive(
@@ -1038,6 +1167,14 @@ def e0_sweep(
             drive=drive_value, raw_leak_init_seed=seed,
             washout=washout, jacobian_samples=jacobian_samples,
         ))
+        if _progress_path is not None:
+            _write_e0_progress(
+                _progress_path, _progress_payload(rows, complete=False),
+            )
+    if _progress_path is not None:
+        _write_e0_progress(
+            _progress_path, _progress_payload(rows, complete=True),
+        )
     return rows
 
 
@@ -1331,6 +1468,7 @@ def main(argv: list[str] | None = None) -> int:
             small_world_k=args.small_world_k,
             small_world_p=args.small_world_p,
             small_world_seed=args.small_world_seed,
+            progress_json=args.output / "e0_progress.json",
         )
         elapsed = time.time() - t0
         row_dicts = [asdict(r) for r in rows]
@@ -1414,6 +1552,7 @@ def main(argv: list[str] | None = None) -> int:
                 f"first {args.max_corners}" if args.max_corners > 0 else "full grid"
             ),
             "n_corners": len(rows),
+            "complete": True,
             "elapsed_s": elapsed,
             "thresholds": {
                 "mc_above": E0_PASS_MC_ABOVE,
